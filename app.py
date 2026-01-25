@@ -35,7 +35,6 @@ from openai import OpenAI
 
 from routes_curriculum import router as curriculum_router
 
-
 QUOTAS = {
     "free": {"lesson": 10, "exam": 5, "enarm": 0, "gpc_summary": 0},
     "pro": {"lesson": 250, "exam": 150, "enarm": 100, "gpc_summary": 50},
@@ -244,6 +243,7 @@ if STRIPE_SECRET_KEY:
 # SQLite config (define BEFORE functions that use DB_PATH)
 # ----------------------------
 DB_PATH = os.getenv("EVANTIS_DB_PATH", str(BASE_DIR / "evantis.sqlite3"))
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 PRO_GPC_SUMMARY_MONTHLY_CAP = int(os.getenv("PRO_GPC_SUMMARY_MONTHLY_CAP", "30"))
 PREMIUM_GPC_SUMMARY_MONTHLY_CAP = int(os.getenv("PREMIUM_GPC_SUMMARY_MONTHLY_CAP", "200"))
@@ -441,6 +441,21 @@ def db_init():
             module TEXT NOT NULL,
             count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, yyyymm, module)
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limit (
+            key TEXT PRIMARY KEY,
+            window_start INTEGER NOT NULL,
+            count INTEGER NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            user_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, key)
         )
         """)
         conn.execute("""
