@@ -1317,13 +1317,18 @@ FORMATO OBLIGATORIO DE INICIO (NO OMITIR):
 # ----------------------------
 def build_gpc_summary_prompt(subject_name: str, topic_name: str) -> str:
     return f"""
-Genera un RESUMEN ENARM basado en Guías de Práctica Clínica (GPC) mexicanas vigentes.
+Genera un RESUMEN basado en Guías de Práctica Clínica (GPC) mexicanas vigentes.
 El contenido debe ser ORIGINAL, EDUCATIVO y NO copiar texto literal de ninguna guía.
 
 Materia: {subject_name}
 Tema ENARM: {topic_name}
 
-Estructura OBLIGATORIA (Markdown):
+REGLA CRÍTICA:
+- DEBES usar web_search para identificar una GPC mexicana pertinente y vigente.
+- NO inventes enlaces. Si no encuentras URL exacta, escribe "Enlace: no disponible en la consulta."
+- NO omitas la sección "## Validación de la GPC consultada".
+
+Estructura OBLIGATORIA (Markdown), en este orden:
 
 ## Puntos clave ENARM
 ## Diagnóstico y criterios
@@ -1332,25 +1337,21 @@ Estructura OBLIGATORIA (Markdown):
 ## Algoritmo práctico (pasos numerados)
 ## Validación de la GPC consultada
 
-## Justificación de pertinencia (OBLIGATORIA)
+Dentro de "## Validación de la GPC consultada" incluye OBLIGATORIAMENTE estas líneas EXACTAS (con dos puntos):
+- Nombre: <nombre oficial exacto de la GPC>
+- Año: <YYYY>
+- Institución: <CENETEC/SSA/IMSS/ISSSTE/etc.>
+- Última actualización: <YYYY-MM-DD o Mes YYYY o "no especificada en la fuente consultada">
+- Enlace: <URL exacta> o "no disponible en la consulta."
 
-En 1–2 líneas, explica explícitamente por qué la Guía de Práctica Clínica consultada
-corresponde directamente al tema solicitado (**{topic_name}**) y no a otro problema clínico distinto.
+## Justificación de pertinencia (OBLIGATORIA)
+En 1–2 líneas, explica explícitamente por qué la GPC consultada corresponde directamente
+al tema solicitado (**{topic_name}**) y no a otro problema clínico distinto.
 
 Reglas duras:
 - Prohibido copiar o parafrasear texto literal de GPC.
 - Todo debe estar redactado con lenguaje académico propio.
-- La sección final es OBLIGATORIA y debe incluir:
-  - Nombre exacto de la GPC
-  - Año
-  - Última actualización (si no se especifica en la fuente, escribir:
-    "Última actualización: no especificada en la fuente consultada.")
-  - Institución responsable (CENETEC / IMSS / SSA, etc.)
-  - Enlace(s) a la fuente si están disponibles
-  - PROHIBIDO inventar enlaces. Si no encuentras URL exacta, escribe: "Enlace: no disponible en la consulta."
-  - En "Validación de la GPC consultada" incluye SOLO datos verificables por web_search.
 """.strip()
-
 
 def validate_gpc_summary(md: str) -> Tuple[bool, List[str]]:
     errors: List[str] = []
@@ -2782,6 +2783,27 @@ Especialista en preparación ENARM.
 
         if module == "gpc_summary":
             ok_gpc, errs_gpc = validate_gpc_summary(content_text)
+            attempts = 1
+            while (not ok_gpc) and attempts < 3:
+                repair_msg = (
+                    "TU SALIDA NO PASÓ VALIDACIÓN E-VANTIS.\n"
+                    "Errores:\n- " + "\n- ".join(errs_gpc) +
+                    "\n\nREPARA y devuelve SOLO el Markdown final.\n"
+                    "Regla crítica: dentro de '## Validación de la GPC consultada' deben existir EXACTAMENTE:\n"
+                    "- Nombre:\n- Año:\n- Institución:\n- Última actualización:\n- Enlace:\n"
+                    "\n\n---\n\n" + content_text
+                )
+                resp2 = client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": repair_msg},
+                    ],
+                    tools=tools or [],
+                )
+                content_text = (resp2.output_text or "").strip()
+                ok_gpc, errs_gpc = validate_gpc_summary(content_text)
+                attempts += 1
 
             if not ok_gpc:
                 raise HTTPException(status_code=500, detail="Resumen GPC inválido: " + " | ".join(errs_gpc))
