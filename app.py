@@ -2725,6 +2725,9 @@ Especialista en preparación ENARM.
 
         content_text = (resp.output_text or "").strip()
         used_web_search = _resp_used_web_search(resp)
+        if not content_text:
+            raise HTTPException(status_code=502, detail="Modelo devolvió contenido vacío.")
+
 
 
         # ----------------------------
@@ -2804,6 +2807,9 @@ Especialista en preparación ENARM.
             resp_out["gpc_summary"] = content_text
         else:
             resp_out["content"] = content_text  # defensa
+
+        return resp_out
+
 
     finally:
         try:
