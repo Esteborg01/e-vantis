@@ -2732,6 +2732,7 @@ Especialista en preparación ENARM.
 
         else:
             raise HTTPException(status_code=422, detail=f"Módulo no soportado: {module}")
+            
 
         # ----------------------------
         # OpenAI
@@ -2781,32 +2782,48 @@ Especialista en preparación ENARM.
                     detail="Clase inválida (no cumple estándar clínico E-Vantis): " + " | ".join(errs_struct),
                 )
 
+
         if module == "gpc_summary":
             ok_gpc, errs_gpc = validate_gpc_summary(content_text)
             attempts = 1
+
             while (not ok_gpc) and attempts < 3:
                 repair_msg = (
-                    "TU SALIDA NO PASÓ VALIDACIÓN E-VANTIS.\n"
-                    "Errores:\n- " + "\n- ".join(errs_gpc) +
-                    "\n\nREPARA y devuelve SOLO el Markdown final.\n"
-                    "Regla crítica: dentro de '## Validación de la GPC consultada' deben existir EXACTAMENTE:\n"
-                    "- Nombre:\n- Año:\n- Institución:\n- Última actualización:\n- Enlace:\n"
-                    "\n\n---\n\n" + content_text
+                    "Tu respuesta NO cumple el estándar E-VANTIS para resúmenes GPC.\n\n"
+                    "Errores detectados:\n- " + "\n- ".join(errs_gpc) + "\n\n"
+                    "Corrige y devuelve SOLO el Markdown final cumpliendo TODAS las reglas.\n\n"
+                    "Reglas obligatorias:\n"
+                    "- Mantén EXACTAMENTE la sección: '## Validación de la GPC consultada'\n"
+                    "- Dentro de esa sección incluye EXACTAMENTE estas líneas:\n"
+                    "  - Nombre:\n"
+                    "  - Año:\n"
+                    "  - Institución:\n"
+                    "  - Última actualización:\n"
+                    "  - Enlace:\n"
+                    "- Si no existe fecha de actualización, escribe:\n"
+                    "  'Última actualización: no especificada en la fuente consultada.'\n"
+                    "- NO inventes enlaces. Si no hay URL exacta:\n"
+                    "  'Enlace: no disponible en la consulta.'\n"
                 )
+
                 resp2 = client.responses.create(
                     model=model,
                     input=[
                         {"role": "system", "content": system_msg},
-                        {"role": "user", "content": repair_msg},
+                        {"role": "user", "content": repair_msg + "\n\n---\n\n" + content_text},
                     ],
-                    tools=tools or [],
+                    tools=[{"type": "web_search"}],
                 )
+
                 content_text = (resp2.output_text or "").strip()
                 ok_gpc, errs_gpc = validate_gpc_summary(content_text)
                 attempts += 1
 
             if not ok_gpc:
-                raise HTTPException(status_code=500, detail="Resumen GPC inválido: " + " | ".join(errs_gpc))
+                raise HTTPException(
+                    status_code=500,
+                    detail="Resumen GPC inválido: " + " | ".join(errs_gpc),
+                )
 
         # --------------------------------------------------
         # Validación estándar E-Vantis: Preguntas de repaso (todas las lessons)
