@@ -2393,7 +2393,7 @@ Duración:
         ],
     )
 
-    lesson_text = (resp.output_text or "").strip()
+    content_text = (resp.output_text or "").strip()
     
     used_web_search = _resp_used_web_search(resp)
 
@@ -2405,7 +2405,7 @@ Duración:
         module="lesson",
         used_web_search=used_web_search,
         model=model,
-        approx_output_chars=len(lesson_text),
+        approx_output_chars=len(content_text),
     )
 
     return TeachResponse(
@@ -2414,7 +2414,7 @@ Duración:
         level=level,
         duration_minutes=req.duration_minutes,
         title=req.topic,
-        lesson=lesson_text,
+        content=content_text,
     )
 
 def as_str(x: Any) -> str:
@@ -2723,17 +2723,18 @@ Especialista en preparación ENARM.
             tools=tools or [],
         )
 
-        lesson_text = (resp.output_text or "").strip()
+        content_text = (resp.output_text or "").strip()
         used_web_search = _resp_used_web_search(resp)
+
 
         # ----------------------------
         # Validaciones
         # ----------------------------
         if module == "lesson" and npm_profile == "clinicas":
-            ok_struct, errs_struct = validate_clinical_markdown(lesson_text)
+            ok_struct, errs_struct = validate_clinical_markdown(content_text)
             attempts = 1
             while (not ok_struct) and attempts < 3:
-                repair_msg = build_repair_instruction(errs_struct) + "\n\n---\n\n" + lesson_text
+                repair_msg = build_repair_instruction(errs_struct) + "\n\n---\n\n" + content_text
                 resp2 = client.responses.create(
                     model=model,
                     input=[
@@ -2741,8 +2742,10 @@ Especialista en preparación ENARM.
                         {"role": "user", "content": repair_msg},
                     ],
                 )
-                lesson_text = (resp2.output_text or "").strip()
-                ok_struct, errs_struct = validate_clinical_markdown(lesson_text)
+                content_text = (resp2.output_text or "").strip()
+
+                ok_struct, errs_struct = validate_clinical_markdown(content_text)
+
                 attempts += 1
 
             if not ok_struct:
@@ -2752,7 +2755,8 @@ Especialista en preparación ENARM.
                 )
 
         if module == "gpc_summary":
-            ok_gpc, errs_gpc = validate_gpc_summary(lesson_text)
+            ok_gpc, errs_gpc = validate_gpc_summary(content_text)
+
             if not ok_gpc:
                 raise HTTPException(status_code=500, detail="Resumen GPC inválido: " + " | ".join(errs_gpc))
 
@@ -2773,10 +2777,10 @@ Especialista en preparación ENARM.
             module=module,
             used_web_search=used_web_search,
             model=model,
-            approx_output_chars=len(lesson_text),
+            approx_output_chars=len(content_text),
         )
 
-        return {
+        resp_out = {
             "subject": subject_name,
             "subject_id": payload.subject_id,
             "topic": topic_name,
@@ -2785,11 +2789,21 @@ Especialista en preparación ENARM.
             "duration_minutes": duration,
             "module": module,
             "study_mode": study_mode,
-            "lesson": lesson_text,
             "used_guides": bool(used_web_search),
             "certifiable": (module != "gpc_summary") or bool(used_web_search),
             "plan": plan,
         }
+
+        if module == "lesson":
+            resp_out["lesson"] = content_text
+        elif module == "exam":
+            resp_out["exam"] = content_text
+        elif module == "enarm":
+            resp_out["enarm"] = content_text
+        elif module == "gpc_summary":
+            resp_out["gpc_summary"] = content_text
+        else:
+            resp_out["content"] = content_text  # defensa
 
     finally:
         try:
