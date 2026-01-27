@@ -810,6 +810,15 @@ def compute_capabilities(plan: str) -> dict:
         },
     }
 
+def has_review_questions(md: str) -> bool:
+    if not md or not isinstance(md, str):
+        return False
+    tail = md[-3000:].lower()
+    if "## preguntas de repaso" in tail:
+        return True
+    # tolerante: "preguntas" y "repaso" cerca del final
+    return ("preguntas" in tail and "repaso" in tail)
+
 
 @app.get("/auth/me")
 def auth_me(user: dict = Depends(require_user)):
@@ -2653,6 +2662,20 @@ Nivel AUTO:
             else:
                 user_msg += "\n\n" + build_clinical_template_instruction()
 
+            # ------------------------------------------------------------
+            # BLOQUE OBLIGATORIO — PREGUNTAS DE REPASO (TODOS LOS PERFILES)
+            # ------------------------------------------------------------
+            user_msg += """
+
+# BLOQUE OBLIGATORIO AL FINAL (SIEMPRE)
+Al final del documento agrega EXACTAMENTE este encabezado H2:
+## Preguntas de repaso
+
+Debajo incluye 5–8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
+No omitir este bloque.
+""".strip()
+
+
         # ======================================================================
         # MODULE: EXAM
         # ======================================================================
@@ -2762,6 +2785,38 @@ Especialista en preparación ENARM.
 
             if not ok_gpc:
                 raise HTTPException(status_code=500, detail="Resumen GPC inválido: " + " | ".join(errs_gpc))
+
+        # --------------------------------------------------
+        # Validación estándar E-Vantis: Preguntas de repaso (todas las lessons)
+        # --------------------------------------------------
+        if module == "lesson":
+            if not has_review_questions(content_text):
+                repair_msg = """
+FALTA UN REQUISITO OBLIGATORIO DEL ESTÁNDAR E-VANTIS.
+
+Agrega AL FINAL del documento EXACTAMENTE:
+## Preguntas de repaso
+
+Incluye 5–8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
+NO modifiques el resto del documento; solo añade el bloque final.
+""".strip() + "\n\n---\n\n" + content_text
+
+                resp_fix = client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": repair_msg},
+                    ],
+                    tools=tools or [],
+                )
+
+                content_text = (resp_fix.output_text or "").strip()
+                if not content_text:
+                    raise HTTPException(status_code=502, detail="Modelo devolvió contenido vacío (repair preguntas de repaso).")
+
+                if not has_review_questions(content_text):
+                    raise HTTPException(status_code=500, detail="Clase inválida: faltan Preguntas de repaso al final.")
+
 
         # --------------------------------------------------
         # FASE 8 — incrementar cuota SOLO en éxito
