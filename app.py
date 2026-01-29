@@ -35,6 +35,7 @@ from openai import OpenAI
 
 from routes_curriculum import router as curriculum_router
 
+
 QUOTAS = {
     "free": {"lesson": 10, "exam": 5, "enarm": 0, "gpc_summary": 0},
     "pro": {"lesson": 250, "exam": 150, "enarm": 100, "gpc_summary": 50},
@@ -1006,7 +1007,12 @@ def require_admin(x_api_key: str = Depends(require_student_or_admin)) -> str:
 # ----------------------------
 # CORS
 # ----------------------------
-ALLOWED_ORIGINS = os.getenv("EVANTIS_CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+ALLOWED_ORIGINS = os.getenv(
+    "EVANTIS_CORS_ORIGINS",
+    "https://evantis-frontend.onrender.com,http://localhost:5173",
+    "http://localhost:3000,http://localhost:5173"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
@@ -1014,7 +1020,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ----------------------------
 # Exceptions
