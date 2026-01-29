@@ -1009,8 +1009,7 @@ def require_admin(x_api_key: str = Depends(require_student_or_admin)) -> str:
 # ----------------------------
 ALLOWED_ORIGINS = os.getenv(
     "EVANTIS_CORS_ORIGINS",
-    "https://evantis-frontend.onrender.com,http://localhost:5173",
-    "http://localhost:3000,http://localhost:5173"
+    "https://evantis-frontend.onrender.com,http://localhost:5173,http://localhost:3000",
 ).split(",")
 
 app.add_middleware(
