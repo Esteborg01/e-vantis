@@ -13,7 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-
 from fastapi import FastAPI, Depends, HTTPException, Header, Response, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import (
@@ -26,7 +25,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-
 from pydantic import BaseModel, Field, StrictBool
 from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
@@ -36,11 +34,15 @@ from openai import OpenAI
 from routes_curriculum import router as curriculum_router
 
 
+# ----------------------------
+# Quotas por plan / módulo (FASE 8)
+# ----------------------------
 QUOTAS = {
     "free": {"lesson": 10, "exam": 5, "enarm": 0, "gpc_summary": 0},
     "pro": {"lesson": 250, "exam": 150, "enarm": 100, "gpc_summary": 50},
     "premium": {"lesson": 1000, "exam": 500, "enarm": 300, "gpc_summary": 300},
 }
+
 
 def _yyyymm_utc() -> str:
     return datetime.utcnow().strftime("%Y%m")
@@ -66,6 +68,7 @@ def usage_monthly_get_count(conn, user_id: str, module: str, yyyymm: str) -> int
     row = cur.fetchone()
     return int(row[0]) if row else 0
 
+
 def usage_monthly_increment(conn, user_id: str, module: str, yyyymm: str) -> None:
     retries = 6
     backoff = 0.05  # 50ms
@@ -89,8 +92,10 @@ def usage_monthly_increment(conn, user_id: str, module: str, yyyymm: str) -> Non
                 continue
             raise
 
+
 def _rate_limit_key(user_id: str, ip: str, endpoint: str) -> str:
     return f"{endpoint}:{user_id}:{ip}"
+
 
 def enforce_rate_limit(conn, user_id: str, ip: str, endpoint: str, limit_per_minute: int = 30):
     """
@@ -156,6 +161,7 @@ def enforce_rate_limit(conn, user_id: str, ip: str, endpoint: str, limit_per_min
                 continue
             raise
 
+
 def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30):
     """
     Idempotency key anti-lock:
@@ -211,6 +217,7 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
                 backoff *= 2
                 continue
             raise
+
 
 # ----------------------------
 # App + env
@@ -379,6 +386,7 @@ def db_conn():
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+
 def db_init():
     with db_conn() as conn:
         conn.execute("""
@@ -524,6 +532,7 @@ def db_init():
         """)
         conn.commit()
 
+
 def db_log_usage(
     user_id: str,
     endpoint: str,
@@ -560,8 +569,6 @@ def db_log_usage(
                         int(approx_output_chars or 0),
                     ),
                 )
-                # Con isolation_level=None (autocommit) esto no es estrictamente necesario,
-                # pero lo dejamos para compatibilidad.
                 try:
                     conn.commit()
                 except Exception:
@@ -574,7 +581,6 @@ def db_log_usage(
                 backoff *= 2
                 continue
 
-            # Si quieres verlo en logs, habilita EVANTIS_LOG_DB_ERRORS=1
             if os.getenv("EVANTIS_LOG_DB_ERRORS", "0") == "1":
                 try:
                     import logging
@@ -584,7 +590,6 @@ def db_log_usage(
             return
 
         except Exception as e:
-            # Por defecto: silencioso para no romper UX.
             if os.getenv("EVANTIS_LOG_DB_ERRORS", "0") == "1":
                 try:
                     import logging
@@ -592,6 +597,7 @@ def db_log_usage(
                 except Exception:
                     print("db_log_usage failed:", repr(e))
             return
+
 
 def db_get_user_by_id(user_id: str):
     with db_conn() as conn:
@@ -690,6 +696,7 @@ def db_delete_session(session_id: str):
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.commit()
 
+
 def db_revoke_user_sessions(user_id: str):
     with db_conn() as conn:
         conn.execute(
@@ -742,6 +749,7 @@ def db_touch_session_last_seen(user_id: str, jti: str):
     except Exception:
         pass
 
+
 # ----------------------------
 # Auth: require_user / plan gating
 # ----------------------------
@@ -754,7 +762,6 @@ def require_user(token: str = Depends(oauth2_scheme)) -> dict:
         raise HTTPException(status_code=401, detail="Token inválido (sin sub).")
     if not jti:
         raise HTTPException(status_code=401, detail="Sesión inválida o revocada.")
-
 
     u = db_get_user_by_id(user_id)
     if not u or not u["is_active"]:
@@ -792,6 +799,15 @@ def can_use_gpc_summary(plan: Plan) -> bool:
     return plan in ("pro", "premium")
 
 
+def gpc_summary_monthly_cap(plan: str) -> int:
+    p = (plan or "free").strip().lower()
+    if p == "pro":
+        return PRO_GPC_SUMMARY_MONTHLY_CAP
+    if p == "premium":
+        return PREMIUM_GPC_SUMMARY_MONTHLY_CAP
+    return 0
+
+
 def compute_capabilities(plan: str) -> dict:
     plan = (plan or "free").strip().lower()
     return {
@@ -811,13 +827,13 @@ def compute_capabilities(plan: str) -> dict:
         },
     }
 
+
 def has_review_questions(md: str) -> bool:
     if not md or not isinstance(md, str):
         return False
     tail = md[-3000:].lower()
     if "## preguntas de repaso" in tail:
         return True
-    # tolerante: "preguntas" y "repaso" cerca del final
     return ("preguntas" in tail and "repaso" in tail)
 
 
@@ -829,6 +845,7 @@ def auth_me(user: dict = Depends(require_user)):
         "plan": plan,
         "capabilities": compute_capabilities(plan),
     }
+
 
 @app.post("/auth/logout")
 def logout(user: dict = Depends(require_user), token: str = Depends(oauth2_scheme)):
@@ -848,12 +865,8 @@ def logout(user: dict = Depends(require_user), token: str = Depends(oauth2_schem
 
 
 # ----------------------------
-# Monthly quota (GPC summary)
+# Monthly quota (GPC summary / CHAT)
 # ----------------------------
-def _yyyymm_utc() -> str:
-    return datetime.utcnow().strftime("%Y%m")
-
-
 def db_get_monthly_count(user_id: str, module: str) -> int:
     with db_conn() as conn:
         cur = conn.execute(
@@ -878,15 +891,6 @@ def db_inc_monthly_count(user_id: str, module: str):
         conn.commit()
 
 
-def gpc_summary_monthly_cap(plan: str) -> int:
-    p = (plan or "free").strip().lower()
-    if p == "pro":
-        return PRO_GPC_SUMMARY_MONTHLY_CAP
-    if p == "premium":
-        return PREMIUM_GPC_SUMMARY_MONTHLY_CAP
-    return 0
-
-
 def enforce_gpc_summary_quota(user_id: str, plan: str):
     cap = gpc_summary_monthly_cap(plan)
     if cap <= 0:
@@ -897,16 +901,12 @@ def enforce_gpc_summary_quota(user_id: str, plan: str):
             status_code=429,
             detail=f"Límite mensual alcanzado para Resumen GPC ({used}/{cap}).",
         )
-    # OJO: aquí NO consumimos. Solo validamos disponibilidad.
 
 
 def consume_gpc_summary_quota(user_id: str):
     db_inc_monthly_count(user_id, "gpc_summary")
 
 
-# ----------------------------
-# Monthly quota (CHAT)
-# ----------------------------
 def chat_monthly_cap(plan: str) -> int:
     p = (plan or "free").strip().lower()
     if p == "free":
@@ -917,6 +917,7 @@ def chat_monthly_cap(plan: str) -> int:
         return 2000
     return 50
 
+
 def enforce_chat_quota(user_id: str, plan: str):
     cap = chat_monthly_cap(plan)
     used = db_get_monthly_count(user_id, "chat")
@@ -926,9 +927,9 @@ def enforce_chat_quota(user_id: str, plan: str):
             detail=f"Límite mensual alcanzado para Chat ({used}/{cap}).",
         )
 
+
 def consume_chat_quota(user_id: str):
     db_inc_monthly_count(user_id, "chat")
-
 
 
 # ----------------------------
@@ -1025,7 +1026,6 @@ app.add_middleware(
 # ----------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # "exc.body" a veces es bytes, dict, None o FormData (no serializable)
     body = None
     try:
         if exc.body is None:
@@ -1033,10 +1033,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         elif isinstance(exc.body, (dict, list, str, int, float, bool)):
             body = exc.body
         elif isinstance(exc.body, (bytes, bytearray)):
-            # intenta decodificar bytes
             body = exc.body.decode("utf-8", errors="replace")
         else:
-            # FormData u otros objetos: conviértelos a string seguro
             body = str(exc.body)
     except Exception:
         body = "<unserializable>"
@@ -1048,6 +1046,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "body": body,
         },
     )
+
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request, exc):
@@ -1070,7 +1069,7 @@ def on_startup():
 
 
 # ----------------------------
-# Rate limiting
+# Rate limiting (in-memory, por API key)
 # ----------------------------
 RATE_LIMIT_CHAT_PER_HOUR = int(os.getenv("RATE_LIMIT_CHAT_PER_HOUR", "100"))
 RATE_LIMIT_TEACH_PER_HOUR = int(os.getenv("RATE_LIMIT_TEACH_PER_HOUR", "60"))
@@ -1240,14 +1239,64 @@ Reglas duras:
 """.strip()
 
 
+# ----------------------------
+# FASE 4 — Convención editorial (una sola vez, global)
+# ----------------------------
+PHASE4_MD_CONVENTION_V1 = """
+# CONVENCIÓN MARKDOWN CLÍNICA — E-VANTIS v1 (FASE 4 EXPERIMENTAL)
+
+Si editorial_v1=true, DEBES usar estas marcas correctamente (sin relleno):
+
+A) HIGH-YIELD (no cruza líneas; máximo 5–8 por documento):
+==texto==
+
+B) BADGES (solo en headings H2; máximo 2 por sección; SIEMPRE al inicio):
+## [badge:alta_prioridad] Diagnóstico
+Badges soportados: alta_prioridad, concepto_clave, red_flag, error_frecuente, enfoque_enarm
+
+C) CALLOUTS (blockquote explícito; primera línea EXACTA):
+> [callout:perla_clinica]
+> Texto del callout...
+Callouts soportados: perla_clinica, advertencia, punto_de_examen, razonamiento_clinico
+
+Reglas duras:
+- No inventes badges/callouts fuera del set.
+- Mantén Markdown válido.
+- Mantén la estructura E-Vantis sin cambiar nombres ni orden de secciones.
+""".strip()
+
+
+# ----------------------------
+# Helpers: headings (H2) + validación clínica
+# ----------------------------
 def _extract_h2_headings(md: str) -> List[str]:
-    return [h.strip() for h in re.findall(r"^##\s+(.+?)\s*$", md, flags=re.MULTILINE)]
+    raw = [h.strip() for h in re.findall(r"^##\s+(.+?)\s*$", md, flags=re.MULTILINE)]
+    cleaned: List[str] = []
+    for h in raw:
+        # Elimina uno o más badges al inicio: [badge:...]
+        # (PATCH: tolera espacios: [ badge : red_flag ])
+        h2 = re.sub(
+            r"^\s*(?:\[\s*badge\s*:\s*[a-z0-9_-]+\s*\]\s*)+",
+            "",
+            h,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned.append(h2)
+    return cleaned
 
 
 def build_system_npm(profile: str) -> list[str]:
     base = list(NPM_BASE)
     base += list(NPM_PROFILE.get(profile, []))
     return base
+
+
+def _norm_txt(s: str) -> str:
+    # PATCH: normaliza acentos para evitar falsos negativos en validación
+    s = (s or "").lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s
 
 
 def validate_clinical_markdown(md: str) -> Tuple[bool, List[str]]:
@@ -1264,21 +1313,19 @@ def validate_clinical_markdown(md: str) -> Tuple[bool, List[str]]:
     if re.search(r"(?i)\bno aplica\b", md):
         errors.append("Prohibido usar 'No aplica' en clases clínicas.")
 
-    must_terms = ["enfoque diagnóstico", "diagnósticos diferenciales", "estándar de oro", "tamizaje"]
-    missing = [t for t in must_terms if t not in md.lower()]
+    mdn = _norm_txt(md)
+    must_terms = ["enfoque diagnostico", "diagnosticos diferenciales", "estandar de oro", "tamizaje"]
+    missing = [t for t in must_terms if t not in mdn]
     if missing:
         errors.append("En 'Diagnóstico' faltan explícitamente: " + ", ".join(missing))
 
     if "algoritmos de diagnóstico y tratamiento" not in md.lower():
         errors.append("Falta la sección 'Algoritmos de diagnóstico y tratamiento'.")
     else:
-        # Validar SOLO el contenido dentro de la sección de algoritmos
         parts = re.split(r"(?m)^##\s+", md)
         algo_body = ""
         for p in parts:
-            # p inicia con el nombre del heading seguido del contenido
             if p.lower().startswith("algoritmos de diagnóstico y tratamiento"):
-                # reconstruir con "## " removido por split
                 algo_body = p
                 break
 
@@ -1294,7 +1341,6 @@ def validate_clinical_markdown(md: str) -> Tuple[bool, List[str]]:
 
             if not re.search(r"(?m)^\s*1\.\s+", algo_body):
                 errors.append("En algoritmos faltan pasos numerados (1., 2., 3., ...).")
-
 
     return (len(errors) == 0), errors
 
@@ -1317,7 +1363,7 @@ FORMATO OBLIGATORIO DE INICIO (NO OMITIR):
 
 
 # ----------------------------
-# GPC summary (UNA sola definición; compatible con validate_gpc_summary)
+# GPC summary
 # ----------------------------
 def build_gpc_summary_prompt(subject_name: str, topic_name: str) -> str:
     return f"""
@@ -1357,6 +1403,7 @@ Reglas duras:
 - Todo debe estar redactado con lenguaje académico propio.
 """.strip()
 
+
 def validate_gpc_summary(md: str) -> Tuple[bool, List[str]]:
     errors: List[str] = []
     required_section = "## Validación de la GPC consultada"
@@ -1378,12 +1425,11 @@ def validate_gpc_summary(md: str) -> Tuple[bool, List[str]]:
     if "justificación" not in md.lower():
         errors.append("Falta la justificación de pertinencia de la GPC.")
 
-    # Regla defensiva: si hay enlaces pero no hay contenido real de validación, sospecha.
-    # (Esto evita "enlaces inventados" en validaciones flojas.)
     if "http" in md.lower() and "validación de la gpc consultada" not in md.lower():
         errors.append("Incluye enlaces sin sección de validación de GPC.")
-    
+
     return (len(errors) == 0), errors
+
 
 def _resp_used_web_search(r) -> bool:
     try:
@@ -1402,7 +1448,8 @@ def _resp_used_web_search(r) -> bool:
         pass
 
     return False
-    
+
+
 def build_repair_instruction(errors: List[str]) -> str:
     bullets = "\n".join([f"- {e}" for e in errors])
     ordered = "\n".join([f"{i+1}. {t}" for i, t in enumerate(CLINICAL_SECTIONS)])
@@ -1422,7 +1469,6 @@ REPARA y devuelve SOLO el Markdown final, cumpliendo:
 # ----------------------------
 # Subject rules (IMPORTANTE)
 # ----------------------------
-
 NPM_SUBJECT_RULES = {
     "inmunologia": [
         "Se permite mencionar enfermedades y contextos clínicos SOLO para justificar indicaciones.",
@@ -1977,6 +2023,8 @@ class TeachCurriculumIn(BaseModel):
 
     num_questions: int = 8
 
+    editorial_v1: StrictBool = False
+
 
 # ----------------------------
 # Helpers: curriculum, slug, subtopics
@@ -2033,6 +2081,7 @@ def detect_level_simple(topic: str) -> str:
     ]
     return "internado" if any(k in t for k in internado_keywords) else "pregrado"
 
+
 def usage_monthly_get_all(conn, user_id: str, yyyymm: str) -> dict:
     cur = conn.execute(
         "SELECT module, count FROM usage_monthly WHERE user_id=? AND yyyymm=?",
@@ -2043,23 +2092,12 @@ def usage_monthly_get_all(conn, user_id: str, yyyymm: str) -> dict:
 
 
 def build_usage_snapshot(plan: str, used_by_module: dict) -> dict:
-    """
-    Regresa estructura lista para frontend:
-    {
-      "yyyymm": "...",
-      "plan": "...",
-      "modules": {
-          "lesson": {"used": 3, "limit": 10, "remaining": 7},
-          ...
-      }
-    }
-    """
     plan = (plan or "free").lower()
     snapshot = {}
     for module in ("lesson", "exam", "enarm", "gpc_summary"):
         limit = _quota_limit(plan, module)
         used = int(used_by_module.get(module, 0))
-        remaining = None if limit is None else max(0, int(limit) - used)
+        remaining = max(0, int(limit) - used)
         snapshot[module] = {
             "used": used,
             "limit": limit,
@@ -2070,7 +2108,7 @@ def build_usage_snapshot(plan: str, used_by_module: dict) -> dict:
 
 
 # ----------------------------
-# Module prompting
+# Module prompting (EXAM)
 # ----------------------------
 def _exam_spec_for_study_mode(study_mode: StudyMode) -> str:
     if study_mode == "basico":
@@ -2209,7 +2247,6 @@ def register(req: RegisterRequest):
     if not req.password or len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Password muy corto (mínimo 8).")
 
-    # Política de UX/seguridad: no passwords gigantes
     if len(req.password.encode("utf-8")) > 128:
         raise HTTPException(status_code=400, detail="Password demasiado largo (máximo 128 bytes).")
 
@@ -2231,7 +2268,7 @@ def register(req: RegisterRequest):
     now = int(time.time())
     exp = now + (JWT_EXPIRE_MIN * 60)
 
-    db_revoke_user_sessions(user_id)  # opcional: por limpieza
+    db_revoke_user_sessions(user_id)
     db_insert_session(user_id, sid, jti, now, exp, ip=None, user_agent=None)
 
     token = create_access_token(user_id=user_id, plan="free", sid=sid, jti=jti)
@@ -2240,7 +2277,6 @@ def register(req: RegisterRequest):
 
 @app.post("/auth/login", response_model=TokenResponse)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = None):
-
     email = (form_data.username or "").strip().lower()
     password = form_data.password or ""
 
@@ -2258,7 +2294,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
 
     stored = user.get("password_hash", "") or ""
 
-    # Migración SHA-256 -> hash seguro
     if is_sha256_hex(stored):
         if not verify_password_sha256(password, stored):
             raise HTTPException(status_code=401, detail="Credenciales inválidas")
@@ -2278,7 +2313,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
         pass
 
     plan = (user.get("plan") or "free").strip().lower()
-
     if plan not in ("free", "pro", "premium"):
         plan = "free"
 
@@ -2287,7 +2321,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
     now = int(time.time())
     exp = now + (JWT_EXPIRE_MIN * 60)
 
-    # Revoca sesiones previas y crea la nueva
     db_revoke_user_sessions(user["user_id"])
 
     ip = request.client.host if request and request.client else None
@@ -2303,7 +2336,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
 # ----------------------------
 @app.post("/admin/keys", response_model=CreateKeyResponse, dependencies=[Depends(require_admin)])
 def admin_create_key(req: CreateKeyRequest):
-    import secrets
     api_key = req.api_key or f"ev_{secrets.token_urlsafe(24)}"
     db_create_key(api_key=api_key, role=req.role, label=req.label)
     return CreateKeyResponse(api_key=api_key, role=req.role, label=req.label, is_active=True)
@@ -2345,6 +2377,7 @@ def get_session_debug(session_id: str):
     summary, history = get_session(session_id)
     return {"session_id": session_id, "summary": summary, "history": history, "db_path": DB_PATH}
 
+
 @app.get("/usage/me")
 def usage_me(user: dict = Depends(require_user)):
     conn = db_conn()
@@ -2367,8 +2400,9 @@ def usage_me(user: dict = Depends(require_user)):
         except Exception:
             pass
 
+
 # ----------------------------
-# /teach (general)
+# /teach (general) — PATCH: prompt limpio + TeachResponse correcto
 # ----------------------------
 @app.post("/teach", response_model=TeachResponse, dependencies=[Depends(rate_limit_teach)])
 def teach(req: TeachRequest, response: Response, claims: dict = Depends(require_user)):
@@ -2408,7 +2442,6 @@ Duración:
     )
 
     content_text = (resp.output_text or "").strip()
-    
     used_web_search = _resp_used_web_search(resp)
 
     db_log_usage(
@@ -2428,12 +2461,13 @@ Duración:
         level=level,
         duration_minutes=req.duration_minutes,
         title=req.topic,
-        content=content_text,
+        lesson=content_text,
     )
 
+
 def as_str(x: Any) -> str:
-    # Soporta Literal, Enum, str
     return (getattr(x, "value", x) or "").strip()
+
 
 # ----------------------------
 # /teach/curriculum — módulos + guías bajo demanda
@@ -2458,14 +2492,10 @@ def teach_curriculum(
         if duration < 5 or duration > 60:
             raise HTTPException(status_code=422, detail="duration_minutes debe estar entre 5 y 60.")
 
-        # Normalización de nivel visible → interno
         if level.lower() == "clinico":
             level = "internado"
 
-        # Definir module ANTES de validarlo
         module = (as_str(payload.module) or "lesson").strip().lower()
-
-        # Validaciones mínimas (ya con module definido)
         if module not in ("lesson", "exam", "enarm", "gpc_summary"):
             raise HTTPException(status_code=422, detail=f"Módulo no soportado: {module}")
 
@@ -2474,8 +2504,8 @@ def teach_curriculum(
         plan = (user.get("plan") or "free").strip().lower()
         subject_id = (as_str(payload.subject_id) or "").strip().lower()
         raw_topic_id = (as_str(payload.topic_id) or "").strip()
+        editorial_v1 = bool(getattr(payload, "editorial_v1", False))
 
-        # Permitir formato "macro_topic::subtopic"
         if "::" in raw_topic_id:
             topic_id, subtopic_id = raw_topic_id.split("::", 1)
             topic_id = topic_id.strip()
@@ -2483,7 +2513,6 @@ def teach_curriculum(
         else:
             topic_id = raw_topic_id
             subtopic_id = None
-
 
         # ----------------------------
         # Plan gating
@@ -2544,13 +2573,12 @@ def teach_curriculum(
                     break
             if topic:
                 break
-        
+
         if not topic:
             raise HTTPException(
                 status_code=404,
                 detail=f"Topic not found: requested={repr(topic_id)} subject={repr(subject_id)}"
             )
-
 
         topic_name = topic.get("name") or payload.topic_id
 
@@ -2569,7 +2597,7 @@ def teach_curriculum(
         system_rules = build_system_npm(npm_profile)
         system_rules_text = "\n".join([f"- {r}" for r in system_rules]) if system_rules else "- (Sin reglas sistema)"
 
-        subject_rules = NPM_SUBJECT_RULES.get(payload.subject_id, [])
+        subject_rules = NPM_SUBJECT_RULES.get(subject_id, [])
         subject_rules_text = "\n".join([f"- {r}" for r in subject_rules]) if subject_rules else ""
 
         system_msg = f"""
@@ -2605,9 +2633,6 @@ Subtópicos:
             if subject_rules_text:
                 user_msg += f"\n\nReglas específicas de la materia (OBLIGATORIAS):\n{subject_rules_text}"
 
-            # ------------------------------------------------------------
-            # E-VANTIS — PROFUNDIDAD POR NIVEL (CLÍNICAS)
-            # ------------------------------------------------------------
             if npm_profile == "clinicas":
                 lvl = (level or "auto").strip().lower()
 
@@ -2655,9 +2680,10 @@ Nivel AUTO:
 - Comportarse como PREGRADO.
 """
 
-            # ------------------------------------------------------------
-            # Header + plantilla
-            # ------------------------------------------------------------
+            if editorial_v1:
+                user_msg += "\n\n" + PHASE4_MD_CONVENTION_V1
+                user_msg += "\n\nInstrucción: usa badges/callouts SOLO cuando realmente aporten (no saturar)."
+
             user_msg += "\n\n" + build_evantis_header_instruction(subject_name, level, duration, style)
 
             if npm_profile == "basicas":
@@ -2667,10 +2693,10 @@ Nivel AUTO:
             else:
                 user_msg += "\n\n" + build_clinical_template_instruction()
 
-            # ------------------------------------------------------------
-            # BLOQUE OBLIGATORIO — PREGUNTAS DE REPASO (TODOS LOS PERFILES)
-            # ------------------------------------------------------------
-            user_msg += """
+            # PATCH: NO forces un segundo H2 "Preguntas de repaso" en clínicas.
+            # En clínicas YA viene en CLINICAL_SECTIONS y tu validador exige headings exactos.
+            if npm_profile != "clinicas":
+                user_msg += """
 
 # BLOQUE OBLIGATORIO AL FINAL (SIEMPRE)
 Al final del documento agrega EXACTAMENTE este encabezado H2:
@@ -2679,7 +2705,6 @@ Al final del documento agrega EXACTAMENTE este encabezado H2:
 Debajo incluye 5–8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
 No omitir este bloque.
 """.strip()
-
 
         # ======================================================================
         # MODULE: EXAM
@@ -2729,14 +2754,12 @@ Especialista en preparación ENARM.
             if npm_profile == "basicas":
                 raise HTTPException(status_code=422, detail="gpc_summary no disponible en materias básicas.")
 
-            # NOTA: cuota de gpc_summary ahora se controla por usage_monthly (FASE 8 unificada)
             user_msg = build_gpc_summary_prompt(subject_name, topic_name)
             tools = [{"type": "web_search"}]
             system_msg = "Eres E-VANTIS. Especialista en GPC mexicanas."
 
         else:
             raise HTTPException(status_code=422, detail=f"Módulo no soportado: {module}")
-            
 
         # ----------------------------
         # OpenAI
@@ -2757,8 +2780,6 @@ Especialista en preparación ENARM.
         if not content_text:
             raise HTTPException(status_code=502, detail="Modelo devolvió contenido vacío.")
 
-
-
         # ----------------------------
         # Validaciones
         # ----------------------------
@@ -2775,9 +2796,7 @@ Especialista en preparación ENARM.
                     ],
                 )
                 content_text = (resp2.output_text or "").strip()
-
                 ok_struct, errs_struct = validate_clinical_markdown(content_text)
-
                 attempts += 1
 
             if not ok_struct:
@@ -2785,7 +2804,6 @@ Especialista en preparación ENARM.
                     status_code=500,
                     detail="Clase inválida (no cumple estándar clínico E-Vantis): " + " | ".join(errs_struct),
                 )
-
 
         if module == "gpc_summary":
             ok_gpc, errs_gpc = validate_gpc_summary(content_text)
@@ -2829,9 +2847,7 @@ Especialista en preparación ENARM.
                     detail="Resumen GPC inválido: " + " | ".join(errs_gpc),
                 )
 
-        # --------------------------------------------------
         # Validación estándar E-Vantis: Preguntas de repaso (todas las lessons)
-        # --------------------------------------------------
         if module == "lesson":
             if not has_review_questions(content_text):
                 repair_msg = """
@@ -2859,7 +2875,6 @@ NO modifiques el resto del documento; solo añade el bloque final.
 
                 if not has_review_questions(content_text):
                     raise HTTPException(status_code=500, detail="Clase inválida: faltan Preguntas de repaso al final.")
-
 
         # --------------------------------------------------
         # FASE 8 — incrementar cuota SOLO en éxito
@@ -2893,6 +2908,7 @@ NO modifiques el resto del documento; solo añade el bloque final.
             "used_guides": bool(used_web_search),
             "certifiable": (module != "gpc_summary") or bool(used_web_search),
             "plan": plan,
+            "editorial_v1": editorial_v1,
         }
 
         if module == "lesson":
@@ -2904,14 +2920,12 @@ NO modifiques el resto del documento; solo añade el bloque final.
         elif module == "gpc_summary":
             resp_out["gpc_summary"] = content_text
         else:
-            resp_out["content"] = content_text  # defensa
+            resp_out["content"] = content_text
 
         return resp_out
-
 
     finally:
         try:
             conn.close()
         except Exception:
             pass
-
