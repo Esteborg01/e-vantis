@@ -9,12 +9,13 @@ import hashlib
 import hmac
 import secrets
 import stripe
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Response, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import (
     HTTPBearer,
     HTTPAuthorizationCredentials,
@@ -218,6 +219,13 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
                 continue
             raise
 
+def _plan_from_price_id(price_id: str) -> str:
+    pid = (price_id or "").strip()
+    if pid and STRIPE_PRICE_PREMIUM and pid == STRIPE_PRICE_PREMIUM:
+        return "premium"
+    if pid and STRIPE_PRICE_PRO and pid == STRIPE_PRICE_PRO:
+        return "pro"
+    return "free"
 
 # ----------------------------
 # App + env
@@ -246,6 +254,25 @@ EVANTIS_APP_URL = os.getenv("EVANTIS_APP_URL", "http://localhost:5173")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+
+# ----------------------------
+# Email verification config (A3)
+# ----------------------------
+EVANTIS_EMAIL_VERIFY_ENABLED = os.getenv("EVANTIS_EMAIL_VERIFY_ENABLED", "1") == "1"
+EVANTIS_EMAIL_VERIFY_TTL_SECONDS = int(os.getenv("EVANTIS_EMAIL_VERIFY_TTL_SECONDS", "86400"))  # 24h
+EVANTIS_EMAIL_FROM = os.getenv("EVANTIS_EMAIL_FROM", "no-reply@evantis.local")
+
+# Si NO tienes proveedor de correo, deja SMTP_HOST vacío y se imprimirá el link en logs.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1") == "1"
+
+# URL base para verificación: frontend o backend. Ej:
+# https://evantis-frontend.onrender.com/verify-email
+# o https://e-vantis-api.onrender.com/auth/verify-email (si lo manejas en backend)
+EVANTIS_EMAIL_VERIFY_BASE_URL = os.getenv("EVANTIS_EMAIL_VERIFY_BASE_URL", EVANTIS_APP_URL.rstrip("/") + "/verify-email")
 
 # ----------------------------
 # SQLite config (define BEFORE functions that use DB_PATH)
@@ -366,6 +393,84 @@ def require_auth(
 # ----------------------------
 # DB helpers
 # ----------------------------
+def db_set_email_verification(user_id: str, token: str, expires_at: int) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET email_verify_token=?, email_verify_expires_at=?, email_verified=0 WHERE user_id=?",
+            (token, int(expires_at), user_id),
+        )
+        conn.commit()
+
+def db_get_user_by_verify_token(token: str):
+    with db_conn() as conn:
+        cur = conn.execute(
+            "SELECT user_id, email, email_verify_expires_at, email_verified FROM users WHERE email_verify_token=?",
+            (token,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "user_id": row[0],
+            "email": row[1],
+            "expires_at": int(row[2] or 0),
+            "email_verified": bool(int(row[3] or 0)),
+        }
+
+def db_mark_email_verified(user_id: str) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET email_verified=1, email_verify_token=NULL, email_verify_expires_at=NULL WHERE user_id=?",
+            (user_id,),
+        )
+        conn.commit()
+
+def _make_verify_link(token: str) -> str:
+    base = (EVANTIS_EMAIL_VERIFY_BASE_URL or "").strip().rstrip("/")
+    # El frontend puede recibir ?token=... y llamar a backend /auth/verify-email si quieres.
+    return f"{base}?token={token}"
+
+
+def send_verify_email(email: str, token: str) -> str:
+    """
+    En producción: envía correo si hay SMTP.
+    Sin proveedor: imprime el link en logs y regresa el link.
+    """
+    link = _make_verify_link(token)
+
+    # Fallback: sin SMTP → imprimir link (MVP)
+    if not SMTP_HOST:
+        print(f"[EMAIL_VERIFY_LINK] email={email} link={link}")
+        return link
+
+    # SMTP simple (opcional)
+    try:
+        import smtplib
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["Subject"] = "Verifica tu correo — E-Vantis"
+        msg["From"] = EVANTIS_EMAIL_FROM
+        msg["To"] = email
+        msg.set_content(
+            "Verifica tu correo para activar tu cuenta.\n\n"
+            f"Link de verificación:\n{link}\n\n"
+            "Si no solicitaste esto, ignora este correo."
+        )
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+
+        return link
+    except Exception as e:
+        # Si falla SMTP, no bloquees MVP: imprime link y listo
+        print(f"[EMAIL_VERIFY_FALLBACK] smtp_failed={repr(e)} email={email} link={link}")
+        return link
+
 def db_conn():
     # Autocommit reduce locks largos (cada statement se confirma al vuelo)
     conn = sqlite3.connect(
@@ -486,6 +591,29 @@ def db_init():
         conn.commit()
 
         # ----------------------------
+        # Email verification (MVP)
+        # ----------------------------
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN email_verify_token TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN email_verify_expires_at INTEGER")
+        except Exception:
+            pass
+
+        # Backfill defensivo para bases existentes
+        try:
+            conn.execute("UPDATE users SET email_verified=0 WHERE email_verified IS NULL")
+        except Exception:
+            pass
+
+
+        # ----------------------------
         # Stripe fields on users (MVP)
         # ----------------------------
         try:
@@ -598,23 +726,43 @@ def db_log_usage(
                     print("db_log_usage failed:", repr(e))
             return
 
-
 def db_get_user_by_id(user_id: str):
     with db_conn() as conn:
         cur = conn.execute(
-            "SELECT user_id, email, plan, is_active FROM users WHERE user_id = ?",
+            """
+            SELECT user_id, email, plan, is_active, email_verified
+            FROM users
+            WHERE user_id = ?
+            """,
             (user_id,),
         )
         row = cur.fetchone()
         if not row:
             return None
-        return {"user_id": row[0], "email": row[1], "plan": row[2], "is_active": bool(row[3])}
-
+        return {
+            "user_id": row[0],
+            "email": row[1],
+            "plan": row[2],
+            "is_active": bool(int(row[3] or 0)),
+            "email_verified": bool(int(row[4] or 0)),
+        }
 
 def db_get_user_by_email(email: str):
     with db_conn() as conn:
         cur = conn.execute(
-            "SELECT user_id, email, password_hash, plan, is_active FROM users WHERE email = ?",
+            """
+            SELECT
+              user_id,
+              email,
+              password_hash,
+              plan,
+              is_active,
+              email_verified,
+              email_verify_expires_at,
+              email_verify_token
+            FROM users
+            WHERE email = ?
+            """,
             (email.strip().lower(),),
         )
         row = cur.fetchone()
@@ -625,7 +773,10 @@ def db_get_user_by_email(email: str):
             "email": row[1],
             "password_hash": row[2],
             "plan": row[3],
-            "is_active": bool(row[4]),
+            "is_active": bool(int(row[4] or 0)),
+            "email_verified": bool(int(row[5] or 0)),
+            "email_verify_expires_at": int(row[6] or 0),
+            "email_verify_token": row[7],
         }
 
 
@@ -660,6 +811,47 @@ def db_update_password_hash(user_id: str, new_hash: str) -> None:
         )
         conn.commit()
 
+def db_set_plan(user_id: str, plan: str) -> None:
+    plan = (plan or "free").strip().lower()
+    if plan not in ("free", "pro", "premium"):
+        plan = "free"
+    with db_conn() as conn:
+        conn.execute("UPDATE users SET plan=? WHERE user_id=?", (plan, user_id))
+        conn.commit()
+
+
+def db_update_stripe_fields(
+    user_id: str,
+    customer_id: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    status: Optional[str] = None,
+    current_period_end: Optional[int] = None,
+) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET
+              stripe_customer_id = COALESCE(?, stripe_customer_id),
+              stripe_subscription_id = COALESCE(?, stripe_subscription_id),
+              stripe_status = COALESCE(?, stripe_status),
+              stripe_current_period_end = COALESCE(?, stripe_current_period_end)
+            WHERE user_id = ?
+            """,
+            (customer_id, subscription_id, status, current_period_end, user_id),
+        )
+        conn.commit()
+
+
+def db_get_user_by_stripe_customer(customer_id: str):
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id, email, plan FROM users WHERE stripe_customer_id=?",
+            (customer_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"user_id": row[0], "email": row[1], "plan": row[2]}
 
 def db_load_session(session_id: str):
     with db_conn() as conn:
@@ -1020,6 +1212,82 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        # Si no configuraste secreto, no aceptes webhooks silenciosamente
+        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET no configurado")
+
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Firma Stripe inválida")
+
+    etype = event.get("type", "")
+    data = (event.get("data", {}) or {}).get("object", {}) or {}
+
+    # Utilidad: status activo
+    def _is_active(sub_status: str) -> bool:
+        s = (sub_status or "").lower()
+        return s in ("active", "trialing")
+
+    # ============================
+    # subscription events
+    # ============================
+    if etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+        customer_id = data.get("customer")
+        sub_id = data.get("id")
+        sub_status = data.get("status", "")
+        current_period_end = int(data.get("current_period_end") or 0)
+
+        # price id (primera línea)
+        price_id = ""
+        try:
+            items = (data.get("items", {}) or {}).get("data", []) or []
+            if items:
+                price = (items[0].get("price") or {})
+                price_id = price.get("id") or ""
+        except Exception:
+            price_id = ""
+
+        # Resolver plan por price_id
+        desired_plan = _plan_from_price_id(price_id)
+
+        # Buscar user por stripe customer
+        u = db_get_user_by_stripe_customer(customer_id) if customer_id else None
+        if not u:
+            # Si no existe el mapeo, registra el evento y no truena
+            print(f"[STRIPE_WEBHOOK] customer_not_mapped type={etype} customer={customer_id}")
+            return {"ok": True}
+
+        # Actualiza campos Stripe en user
+        db_update_stripe_fields(
+            user_id=u["user_id"],
+            customer_id=customer_id,
+            subscription_id=sub_id,
+            status=sub_status,
+            current_period_end=current_period_end if current_period_end else None,
+        )
+
+        # Degradación automática a free si NO activo o si deleted
+        if (etype == "customer.subscription.deleted") or (not _is_active(sub_status)):
+            db_set_plan(u["user_id"], "free")
+            return {"ok": True, "plan": "free", "status": sub_status}
+
+        # Si está activo, set plan según price
+        if desired_plan in ("pro", "premium"):
+            db_set_plan(u["user_id"], desired_plan)
+            return {"ok": True, "plan": desired_plan, "status": sub_status}
+
+        # Si no reconoce price_id → por seguridad free
+        db_set_plan(u["user_id"], "free")
+        return {"ok": True, "plan": "free", "status": sub_status}
+
+    return {"ok": True}
 
 # ----------------------------
 # Exceptions
@@ -1985,6 +2253,11 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
 
+class RegisterResponse(BaseModel):
+    ok: bool = True
+    status: Literal["pending_verification", "registered"] = "pending_verification"
+    email: str
+    verify_link: Optional[str] = None  # solo para MVP/logs
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -2238,7 +2511,26 @@ def chat(req: ChatRequest, user: dict = Depends(require_user)):
 # ----------------------------
 # Auth
 # ----------------------------
-@app.post("/auth/register", response_model=TokenResponse)
+@app.get("/auth/verify-email")
+def verify_email(token: str):
+    if not token or len(token) < 16:
+        raise HTTPException(status_code=400, detail="Token inválido.")
+
+    row = db_get_user_by_verify_token(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="Token no encontrado o ya usado.")
+
+    if bool(row.get("email_verified", False)):
+        return {"ok": True, "status": "already_verified"}
+
+    expires_at = int(row.get("expires_at") or 0)
+    if expires_at and int(time.time()) > expires_at:
+        raise HTTPException(status_code=410, detail="Token expirado. Solicita uno nuevo.")
+
+    db_mark_email_verified(row["user_id"])
+    return {"ok": True, "status": "verified"}
+
+@app.post("/auth/register", response_model=RegisterResponse)
 def register(req: RegisterRequest):
     email = (req.email or "").strip().lower()
 
@@ -2246,7 +2538,6 @@ def register(req: RegisterRequest):
         raise HTTPException(status_code=400, detail="Email inválido.")
     if not req.password or len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Password muy corto (mínimo 8).")
-
     if len(req.password.encode("utf-8")) > 128:
         raise HTTPException(status_code=400, detail="Password demasiado largo (máximo 128 bytes).")
 
@@ -2261,19 +2552,18 @@ def register(req: RegisterRequest):
         raise HTTPException(status_code=500, detail="No se pudo procesar la contraseña. Intenta de nuevo.")
 
     user_id = db_create_user(email=email, password_hash=pw_hash, plan="free")
-    db_touch_login(user_id)
 
-    sid = "sid_" + uuid.uuid4().hex
-    jti = "jti_" + uuid.uuid4().hex
-    now = int(time.time())
-    exp = now + (JWT_EXPIRE_MIN * 60)
+    # A3: generar token verify
+    if EVANTIS_EMAIL_VERIFY_ENABLED:
+        token = "evv_" + secrets.token_urlsafe(24)
+        expires_at = int(time.time()) + EVANTIS_EMAIL_VERIFY_TTL_SECONDS
+        db_set_email_verification(user_id=user_id, token=token, expires_at=expires_at)
+        verify_link = send_verify_email(email=email, token=token)
+        return RegisterResponse(ok=True, status="pending_verification", email=email, verify_link=verify_link)
 
-    db_revoke_user_sessions(user_id)
-    db_insert_session(user_id, sid, jti, now, exp, ip=None, user_agent=None)
-
-    token = create_access_token(user_id=user_id, plan="free", sid=sid, jti=jti)
-    return TokenResponse(access_token=token, plan="free")
-
+    # Si desactivas email verify (solo para entornos cerrados)
+    db_mark_email_verified(user_id)
+    return RegisterResponse(ok=True, status="registered", email=email, verify_link=None)
 
 @app.post("/auth/login", response_model=TokenResponse)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = None):
@@ -2311,6 +2601,14 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
         db_touch_login(user["user_id"])
     except Exception:
         pass
+
+    # A3: bloquear login hasta verificar email
+    if EVANTIS_EMAIL_VERIFY_ENABLED and not bool(user.get("email_verified", False)):
+        # Si hay token aún activo, el usuario debe usarlo.
+        raise HTTPException(
+            status_code=403,
+            detail="Correo no verificado. Revisa tu bandeja o solicita reenvío del enlace.",
+        )
 
     plan = (user.get("plan") or "free").strip().lower()
     if plan not in ("free", "pro", "premium"):
@@ -2477,7 +2775,7 @@ def teach_curriculum(
     payload: TeachCurriculumIn,
     request: Request,
     user: dict = Depends(require_user),
-    idempotency_key: str | None = Header(default=None, convert_underscores=False),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     conn = db_conn()
     ip = request.client.host if request.client else "unknown"
