@@ -1493,51 +1493,53 @@ def price_id_for_plan(plan: str) -> str:
         return STRIPE_PRICE_PREMIUM
     return ""
 
-
-@app.post("/billing/checkout", response_model=CheckoutResponse)
-def billing_checkout(req: CheckoutRequest, user: dict = Depends(require_user)):
+@app.post("/billing/checkout")
+async def billing_checkout(
+    payload: dict,
+    user=Depends(get_current_user),
+):
     try:
+        # --- Validaciones duras (NO deben escapar como RuntimeError) ---
         assert_stripe_ready()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-    plan_req = (req.plan or "").strip().lower()
-    price_id = price_id_for_plan(plan_req)
-    if not price_id:
-        raise HTTPException(status_code=500, detail="Stripe price ID no configurado para ese plan.")
+        plan = (payload or {}).get("plan")
+        if plan not in ("pro", "premium"):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Plan inválido. Usa 'pro' o 'premium'."},
+            )
 
-    # Trae email del usuario desde DB (tu require_user trae user_id + plan)
-    u = db_get_user_by_id(user["user_id"])
-    if not u:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
-    email = (u.get("email") or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Usuario sin email válido.")
+        price_id = (
+            STRIPE_PRICE_PRO if plan == "pro" else STRIPE_PRICE_PREMIUM
+        )
+        if not price_id:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Price ID no configurado para el plan."},
+            )
 
-    customer_id = get_or_create_customer(user["user_id"], email)
+        # --- Crear sesión de Stripe ---
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer_email=user["email"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+            metadata={
+                "user_id": user["user_id"],
+                "plan": plan,
+            },
+        )
 
-    # Checkout Session (suscripción)
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        customer=customer_id,
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=STRIPE_SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=STRIPE_CANCEL_URL,
-        # redundancia útil para debugging/webhook
-        metadata={
-            "evantis_user_id": user["user_id"],
-            "evantis_plan_requested": plan_req,
-            "evantis_env": STRIPE_MODE,
-        },
-        allow_promotion_codes=True,
-        customer_update={"address": "auto"},
-    )
+        return {"url": session.url}
 
-    url = (session.get("url") or "").strip()
-    if not url:
-        raise HTTPException(status_code=502, detail="Stripe no devolvió URL de checkout.")
-    return CheckoutResponse(url=url)
-
+    except Exception as e:
+        # 🔒 NUNCA dejes escapar la excepción
+        print("❌ billing/checkout error:", str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Stripe error: {str(e)}"},
+        )
 
 @app.post("/billing/portal", response_model=PortalResponse)
 def billing_portal(user: dict = Depends(require_user)):
