@@ -284,8 +284,16 @@ SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1") == "1"
 # URL base para verificación: frontend o backend. Ej:
 # https://evantis-frontend.onrender.com/verify-email
 # o https://e-vantis-api.onrender.com/auth/verify-email (si lo manejas en backend)
-EVANTIS_EMAIL_VERIFY_BASE_URL = os.getenv("EVANTIS_EMAIL_VERIFY_BASE_URL", EVANTIS_APP_URL.rstrip("/") + "/verify-email")
 
+EVANTIS_APP_URL = os.getenv(
+    "EVANTIS_APP_URL",
+    "https://evantis-frontend.onrender.com"
+)
+
+EVANTIS_EMAIL_VERIFY_BASE_URL = os.getenv(
+    "EVANTIS_EMAIL_VERIFY_BASE_URL",
+    EVANTIS_APP_URL.rstrip("/") + "/verify-email"
+)
 # ----------------------------
 # SQLite config (define BEFORE functions that use DB_PATH)
 # ----------------------------
