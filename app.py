@@ -219,14 +219,6 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
                 continue
             raise
 
-def _plan_from_price_id(price_id: str) -> str:
-    pid = (price_id or "").strip()
-    if pid and STRIPE_PRICE_PREMIUM and pid == STRIPE_PRICE_PREMIUM:
-        return "premium"
-    if pid and STRIPE_PRICE_PRO and pid == STRIPE_PRICE_PRO:
-        return "pro"
-    return "free"
-
 # ----------------------------
 # App + env
 # ----------------------------
@@ -242,18 +234,38 @@ load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ----------------------------
-# Stripe config
-# ----------------------------
+# =========================
+# STRIPE CONFIG (GLOBAL)
+# =========================
+STRIPE_MODE = os.getenv("STRIPE_MODE", "test").strip().lower()  # "test" o "live"
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
 STRIPE_PRICE_PREMIUM = os.getenv("STRIPE_PRICE_PREMIUM", "")
-EVANTIS_APP_URL = os.getenv("EVANTIS_APP_URL", "http://localhost:5173")
 
+# Set API key early if provided (startup también lo refuerza)
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+def assert_stripe_mode():
+    if STRIPE_MODE not in ("test", "live"):
+        raise RuntimeError("STRIPE_MODE debe ser 'test' o 'live'")
+
+    if STRIPE_SECRET_KEY:
+        if STRIPE_MODE == "test" and not STRIPE_SECRET_KEY.startswith("sk_test_"):
+            raise RuntimeError("Anti-mezcla: STRIPE_MODE=test pero STRIPE_SECRET_KEY no es sk_test_")
+        if STRIPE_MODE == "live" and not STRIPE_SECRET_KEY.startswith("sk_live_"):
+            raise RuntimeError("Anti-mezcla: STRIPE_MODE=live pero STRIPE_SECRET_KEY no es sk_live_")
+
+    # Si vas a usar webhook, exige whsec_
+    if STRIPE_WEBHOOK_SECRET and not STRIPE_WEBHOOK_SECRET.startswith("whsec_"):
+        raise RuntimeError("STRIPE_WEBHOOK_SECRET inválido")
+
+    # Si tienes webhook secret, exige price IDs
+    if STRIPE_WEBHOOK_SECRET:
+        if not STRIPE_PRICE_PRO or not STRIPE_PRICE_PREMIUM:
+            raise RuntimeError("Faltan STRIPE_PRICE_PRO / STRIPE_PRICE_PREMIUM")
 
 # ----------------------------
 # Email verification config (A3)
@@ -417,6 +429,32 @@ def db_get_user_by_verify_token(token: str):
             "email_verified": bool(int(row[3] or 0)),
         }
 
+def db_register_stripe_event(event_id: str) -> bool:
+    """
+    True  -> evento nuevo
+    False -> evento duplicado (ya procesado)
+    """
+    if not event_id:
+        return True
+
+    with db_conn() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO stripe_events (event_id, created_at) VALUES (?, ?)",
+                (event_id, int(time.time()))
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+def plan_from_price_id(price_id: str) -> str:
+    if price_id == STRIPE_PRICE_PREMIUM:
+        return "premium"
+    if price_id == STRIPE_PRICE_PRO:
+        return "pro"
+    return "free"
+
 def db_mark_email_verified(user_id: str) -> None:
     with db_conn() as conn:
         conn.execute(
@@ -500,6 +538,12 @@ def db_init():
             summary TEXT NOT NULL,
             history_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_events (
+            event_id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
         )
         """)
         conn.execute("""
@@ -1215,77 +1259,110 @@ app.add_middleware(
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    if not STRIPE_WEBHOOK_SECRET:
-        # Si no configuraste secreto, no aceptes webhooks silenciosamente
-        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET no configurado")
-
     payload = await request.body()
-    sig = request.headers.get("stripe-signature", "")
+    sig_header = request.headers.get("Stripe-Signature")
 
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe webhook no configurado (falta STRIPE_WEBHOOK_SECRET)"
+        )
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing Stripe signature")
+
+    # Verificación de firma (seguridad)
     try:
-        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Firma Stripe inválida")
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        print("[STRIPE_WEBHOOK] signature_error:", repr(e))
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
 
-    etype = event.get("type", "")
-    data = (event.get("data", {}) or {}).get("object", {}) or {}
 
-    # Utilidad: status activo
-    def _is_active(sub_status: str) -> bool:
-        s = (sub_status or "").lower()
-        return s in ("active", "trialing")
+    # Anti-mezcla TEST / LIVE (seguridad operativa)
+    if STRIPE_MODE == "test" and event.get("livemode") is True:
+        raise HTTPException(status_code=400, detail="Evento LIVE en backend TEST")
 
-    # ============================
-    # subscription events
-    # ============================
-    if etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
-        customer_id = data.get("customer")
-        sub_id = data.get("id")
-        sub_status = data.get("status", "")
-        current_period_end = int(data.get("current_period_end") or 0)
+    if STRIPE_MODE == "live" and event.get("livemode") is False:
+        raise HTTPException(status_code=400, detail="Evento TEST en backend LIVE")
 
-        # price id (primera línea)
+    # Idempotencia
+    event_id = event.get("id") or ""
+    if not event_id:
+        return {"ok": True}
+
+    if not db_register_stripe_event(event_id):
+        return {"ok": True, "duplicate": True}
+
+    event_type = (event.get("type") or "").strip()
+    obj = (event.get("data") or {}).get("object") or {}
+
+    # ----------------------------
+    # Subscription lifecycle
+    # ----------------------------
+    if event_type in (
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    ):
+        customer_id = (obj.get("customer") or "").strip()
+        sub_id = (obj.get("id") or "").strip()
+        status = (obj.get("status") or "").strip()
+        current_period_end = int(obj.get("current_period_end") or 0)
+
+        # price id (primera línea del subscription item)
         price_id = ""
         try:
-            items = (data.get("items", {}) or {}).get("data", []) or []
+            items = (obj.get("items") or {}).get("data") or []
             if items:
                 price = (items[0].get("price") or {})
-                price_id = price.get("id") or ""
+                price_id = (price.get("id") or "").strip()
         except Exception:
             price_id = ""
 
-        # Resolver plan por price_id
-        desired_plan = _plan_from_price_id(price_id)
+        # Resolver usuario por customer_id
+        user = db_get_user_by_stripe_customer(customer_id) if customer_id else None
+        if not user:
+            print(f"[STRIPE_WEBHOOK] unlinked_customer event={event_type} customer={customer_id}")
+            return {"ok": True, "unlinked_customer": True}
 
-        # Buscar user por stripe customer
-        u = db_get_user_by_stripe_customer(customer_id) if customer_id else None
-        if not u:
-            # Si no existe el mapeo, registra el evento y no truena
-            print(f"[STRIPE_WEBHOOK] customer_not_mapped type={etype} customer={customer_id}")
-            return {"ok": True}
-
-        # Actualiza campos Stripe en user
+        # Persistir estado Stripe (fuente de verdad)
         db_update_stripe_fields(
-            user_id=u["user_id"],
+            user_id=user["user_id"],
             customer_id=customer_id,
             subscription_id=sub_id,
-            status=sub_status,
+            status=status,
             current_period_end=current_period_end if current_period_end else None,
         )
 
-        # Degradación automática a free si NO activo o si deleted
-        if (etype == "customer.subscription.deleted") or (not _is_active(sub_status)):
-            db_set_plan(u["user_id"], "free")
-            return {"ok": True, "plan": "free", "status": sub_status}
+        # Downgrade NO agresivo: solo terminales
+        terminal = status in ("canceled", "incomplete_expired")
+        if event_type == "customer.subscription.deleted" or terminal:
+            db_set_plan(user["user_id"], "free")
+            return {"ok": True, "plan": "free", "status": status}
 
-        # Si está activo, set plan según price
-        if desired_plan in ("pro", "premium"):
-            db_set_plan(u["user_id"], desired_plan)
-            return {"ok": True, "plan": desired_plan, "status": sub_status}
+        # Activo o trial: asignar plan según price
+        if status in ("active", "trialing"):
+            plan = plan_from_price_id(price_id)
+            db_set_plan(user["user_id"], plan)
+            return {"ok": True, "plan": plan, "status": status}
 
-        # Si no reconoce price_id → por seguridad free
-        db_set_plan(u["user_id"], "free")
-        return {"ok": True, "plan": "free", "status": sub_status}
+        # Estados intermedios (past_due/unpaid/incomplete/etc):
+        # NO degradamos aquí; solo registramos status (ya guardado).
+        return {"ok": True, "status": status, "plan_unchanged": True}
+
+    # ----------------------------
+    # Invoices (por ahora no cambian plan)
+    # ----------------------------
+    if event_type == "invoice.paid":
+        return {"ok": True}
+
+    if event_type == "invoice.payment_failed":
+        return {"ok": True}
 
     return {"ok": True}
 
@@ -1328,13 +1405,17 @@ async def unhandled_exception_handler(request, exc):
         content={"detail": "Error interno. Revisa logs del servidor."},
     )
 
-
 @app.on_event("startup")
 def on_startup():
     assert_config_or_die()
     db_init()
-    print(f">>> Startup OK | DB={DB_PATH}")
+    assert_stripe_mode()
 
+    # Stripe API key (necesario para Checkout/Portal/Customers/Subscriptions server-side)
+    if STRIPE_SECRET_KEY:
+        stripe.api_key = STRIPE_SECRET_KEY
+
+    print(f">>> Startup OK | DB={DB_PATH} | STRIPE_MODE={STRIPE_MODE}")
 
 # ----------------------------
 # Rate limiting (in-memory, por API key)
