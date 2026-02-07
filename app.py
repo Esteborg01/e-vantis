@@ -284,6 +284,13 @@ def assert_stripe_ready():
 # ----------------------------
 # Email verification config (A3)
 # ----------------------------
+# A3 QA MODE
+# Permite login aunque el correo no esté verificado.
+# ⚠️ SOLO PARA QA / DESARROLLO. En producción debe ser 0.
+EVANTIS_ALLOW_UNVERIFIED_LOGIN = os.getenv(
+    "EVANTIS_ALLOW_UNVERIFIED_LOGIN", "0"
+) == "1"
+
 EVANTIS_EMAIL_VERIFY_ENABLED = os.getenv("EVANTIS_EMAIL_VERIFY_ENABLED", "1") == "1"
 EVANTIS_EMAIL_VERIFY_TTL_SECONDS = int(os.getenv("EVANTIS_EMAIL_VERIFY_TTL_SECONDS", "86400"))  # 24h
 EVANTIS_EMAIL_FROM = os.getenv("EVANTIS_EMAIL_FROM", "no-reply@evantis.local")
@@ -311,6 +318,10 @@ EVANTIS_EMAIL_VERIFY_BASE_URL = os.getenv(
 
 # Si =1, /auth/register devuelve verify_link (útil para QA). En prod déjalo en 0.
 EVANTIS_RETURN_VERIFY_LINK = os.getenv("EVANTIS_RETURN_VERIFY_LINK", "0") == "1"
+
+# Si =1, permite login aunque el correo no esté verificado (solo QA).
+# En prod real: dejar en 0.
+EVANTIS_ALLOW_UNVERIFIED_LOGIN = os.getenv("EVANTIS_ALLOW_UNVERIFIED_LOGIN", "0") == "1"
 
 # ----------------------------
 # SQLite config (define BEFORE functions that use DB_PATH)
@@ -2866,9 +2877,12 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
     except Exception:
         pass
 
-    # A3: bloquear login hasta verificar email
-    if EVANTIS_EMAIL_VERIFY_ENABLED and not bool(user.get("email_verified", False)):
-        # Si hay token aún activo, el usuario debe usarlo.
+    # A3: bloquear login hasta verificar email (excepto QA)
+    if (
+        EVANTIS_EMAIL_VERIFY_ENABLED
+        and not EVANTIS_ALLOW_UNVERIFIED_LOGIN
+        and not bool(user.get("email_verified", False))
+    ):
         raise HTTPException(
             status_code=403,
             detail="Correo no verificado. Revisa tu bandeja o solicita reenvío del enlace.",
