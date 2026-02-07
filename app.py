@@ -267,6 +267,20 @@ def assert_stripe_mode():
         if not STRIPE_PRICE_PRO or not STRIPE_PRICE_PREMIUM:
             raise RuntimeError("Faltan STRIPE_PRICE_PRO / STRIPE_PRICE_PREMIUM")
 
+def assert_stripe_ready():
+    """
+    Reglas mínimas para usar Checkout/Portal:
+    - STRIPE_SECRET_KEY presente y consistente con STRIPE_MODE
+    - Price IDs presentes
+    """
+    assert_stripe_mode()
+
+    if not STRIPE_SECRET_KEY:
+        raise RuntimeError("Falta STRIPE_SECRET_KEY (Stripe server-side no puede operar).")
+
+    if not STRIPE_PRICE_PRO or not STRIPE_PRICE_PREMIUM:
+        raise RuntimeError("Faltan STRIPE_PRICE_PRO / STRIPE_PRICE_PREMIUM (requeridos para checkout).")
+
 # ----------------------------
 # Email verification config (A3)
 # ----------------------------
@@ -294,6 +308,10 @@ EVANTIS_EMAIL_VERIFY_BASE_URL = os.getenv(
     "EVANTIS_EMAIL_VERIFY_BASE_URL",
     EVANTIS_APP_URL.rstrip("/") + "/verify-email"
 )
+
+# Si =1, /auth/register devuelve verify_link (útil para QA). En prod déjalo en 0.
+EVANTIS_RETURN_VERIFY_LINK = os.getenv("EVANTIS_RETURN_VERIFY_LINK", "0") == "1"
+
 # ----------------------------
 # SQLite config (define BEFORE functions that use DB_PATH)
 # ----------------------------
@@ -1334,9 +1352,22 @@ async def stripe_webhook(request: Request):
 
         # Resolver usuario por customer_id
         user = db_get_user_by_stripe_customer(customer_id) if customer_id else None
+        if not user and customer_id:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                meta = (cust.get("metadata") or {})
+                uid = (meta.get("evantis_user_id") or "").strip()
+                if uid:
+                    # linkear en DB y continuar
+                    db_update_stripe_fields(user_id=uid, customer_id=customer_id)
+                    user = db_get_user_by_id(uid)
+            except Exception as e:
+                print("[STRIPE_WEBHOOK] customer_retrieve_failed:", repr(e))
+
         if not user:
             print(f"[STRIPE_WEBHOOK] unlinked_customer event={event_type} customer={customer_id}")
             return {"ok": True, "unlinked_customer": True}
+
 
         # Persistir estado Stripe (fuente de verdad)
         db_update_stripe_fields(
@@ -1373,6 +1404,141 @@ async def stripe_webhook(request: Request):
         return {"ok": True}
 
     return {"ok": True}
+
+# =========================
+# BILLING (Checkout + Portal)
+# =========================
+
+STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", EVANTIS_APP_URL.rstrip("/") + "/billing/success")
+STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", EVANTIS_APP_URL.rstrip("/") + "/billing/cancel")
+STRIPE_PORTAL_RETURN_URL = os.getenv("STRIPE_PORTAL_RETURN_URL", EVANTIS_APP_URL.rstrip("/") + "/account")
+
+class CheckoutRequest(BaseModel):
+    plan: Literal["pro", "premium"]
+
+class CheckoutResponse(BaseModel):
+    url: str
+
+class PortalResponse(BaseModel):
+    url: str
+
+
+def db_get_stripe_customer_id(user_id: str) -> Optional[str]:
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT stripe_customer_id FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        return (row[0] or "").strip() if row and row[0] else None
+
+
+def db_set_stripe_customer_id(user_id: str, customer_id: str) -> None:
+    if not customer_id:
+        return
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET stripe_customer_id=? WHERE user_id=?",
+            (customer_id, user_id),
+        )
+        conn.commit()
+
+
+def get_or_create_customer(user_id: str, email: str) -> str:
+    # 1) si ya existe en DB, úsalo
+    existing = db_get_stripe_customer_id(user_id)
+    if existing:
+        return existing
+
+    # 2) crea customer con metadata para poder linkear en webhook
+    customer = stripe.Customer.create(
+        email=email,
+        metadata={
+            "evantis_user_id": user_id,
+            "evantis_env": STRIPE_MODE,
+        },
+    )
+    cid = (customer.get("id") or "").strip()
+    db_set_stripe_customer_id(user_id, cid)
+    return cid
+
+
+def price_id_for_plan(plan: str) -> str:
+    plan = (plan or "").strip().lower()
+    if plan == "pro":
+        return STRIPE_PRICE_PRO
+    if plan == "premium":
+        return STRIPE_PRICE_PREMIUM
+    return ""
+
+
+@app.post("/billing/checkout", response_model=CheckoutResponse)
+def billing_checkout(req: CheckoutRequest, user: dict = Depends(require_user)):
+    try:
+        assert_stripe_ready()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    plan_req = (req.plan or "").strip().lower()
+    price_id = price_id_for_plan(plan_req)
+    if not price_id:
+        raise HTTPException(status_code=500, detail="Stripe price ID no configurado para ese plan.")
+
+    # Trae email del usuario desde DB (tu require_user trae user_id + plan)
+    u = db_get_user_by_id(user["user_id"])
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    email = (u.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Usuario sin email válido.")
+
+    customer_id = get_or_create_customer(user["user_id"], email)
+
+    # Checkout Session (suscripción)
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer=customer_id,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=STRIPE_SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=STRIPE_CANCEL_URL,
+        # redundancia útil para debugging/webhook
+        metadata={
+            "evantis_user_id": user["user_id"],
+            "evantis_plan_requested": plan_req,
+            "evantis_env": STRIPE_MODE,
+        },
+        allow_promotion_codes=True,
+        customer_update={"address": "auto"},
+    )
+
+    url = (session.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=502, detail="Stripe no devolvió URL de checkout.")
+    return CheckoutResponse(url=url)
+
+
+@app.post("/billing/portal", response_model=PortalResponse)
+def billing_portal(user: dict = Depends(require_user)):
+    try:
+        assert_stripe_ready()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    u = db_get_user_by_id(user["user_id"])
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    email = (u.get("email") or "").strip().lower()
+
+    customer_id = get_or_create_customer(user["user_id"], email)
+
+    ps = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=STRIPE_PORTAL_RETURN_URL,
+    )
+
+    url = (ps.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=502, detail="Stripe no devolvió URL de portal.")
+    return PortalResponse(url=url)
 
 # ----------------------------
 # Exceptions
@@ -2648,7 +2814,16 @@ def register(req: RegisterRequest):
         expires_at = int(time.time()) + EVANTIS_EMAIL_VERIFY_TTL_SECONDS
         db_set_email_verification(user_id=user_id, token=token, expires_at=expires_at)
         verify_link = send_verify_email(email=email, token=token)
-        return RegisterResponse(ok=True, status="pending_verification", email=email, verify_link=verify_link)
+
+        # Por seguridad: NO devolver verify_link en prod.
+        # Si necesitas QA rápido, set EVANTIS_RETURN_VERIFY_LINK=1
+        return RegisterResponse(
+            ok=True,
+            status="pending_verification",
+            email=email,
+            verify_link=verify_link if EVANTIS_RETURN_VERIFY_LINK else None,
+        )
+
 
     # Si desactivas email verify (solo para entornos cerrados)
     db_mark_email_verified(user_id)
@@ -2715,7 +2890,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
     db_insert_session(user["user_id"], sid, jti, now, exp, ip=ip, user_agent=ua)
 
     token = create_access_token(user_id=user["user_id"], plan=plan, sid=sid, jti=jti)  # type: ignore[arg-type]
-    return TokenResponse(access_token=token, plan=plan)
+    return TokenResponse(access_token=token, token_type="bearer", plan=plan)
 
 
 # ----------------------------
