@@ -1493,6 +1493,41 @@ def price_id_for_plan(plan: str) -> str:
         return STRIPE_PRICE_PREMIUM
     return ""
 
+def _user_email_or_400(user: dict) -> str:
+    """
+    Obtiene email del objeto 'user' inyectado por require_user().
+    Si no viene, intenta recargar desde DB por user_id.
+    """
+    if not isinstance(user, dict):
+        raise HTTPException(status_code=400, detail="Stripe error: usuario inválido (no dict).")
+
+    email = (user.get("email") or "").strip().lower()
+    if email:
+        return email
+
+    user_id = user.get("user_id") or user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Stripe error: falta user_id para resolver email.")
+
+    # 🔁 Ajusta el nombre de tu función si se llama distinto:
+    # - db_get_user_by_id
+    # - db_get_user
+    # - db_get_user_safe
+    row = None
+    if "db_get_user_by_id" in globals():
+        row = db_get_user_by_id(user_id)
+    elif "db_get_user" in globals():
+        row = db_get_user(user_id)
+
+    if not row or not isinstance(row, dict):
+        raise HTTPException(status_code=400, detail="Stripe error: no se pudo cargar usuario desde DB.")
+
+    email = (row.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Stripe error: email no disponible para Stripe.")
+
+    return email
+
 @app.post("/billing/checkout")
 async def billing_checkout(
     payload: dict,
@@ -1521,7 +1556,7 @@ async def billing_checkout(
         # --- Crear sesión de Stripe ---
         session = stripe.checkout.Session.create(
             mode="subscription",
-            customer_email=user["email"],
+            customer_email = _user_email_or_400(user),
             line_items=[{"price": price_id, "quantity": 1}],
             success_url=STRIPE_SUCCESS_URL,
             cancel_url=STRIPE_CANCEL_URL,
