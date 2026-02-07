@@ -1286,12 +1286,24 @@ ALLOWED_ORIGINS = os.getenv(
     "https://evantis-frontend.onrender.com,http://localhost:5173,http://localhost:3000",
 ).split(",")
 
+# ----------------------------
+# CORS (GLOBAL — Frontend Render)
+# Necesario para:
+# - /teach/curriculum (X-API-Key, Idempotency-Key)
+# - /billing/checkout
+# - /billing/portal
+# ----------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://evantis-frontend.onrender.com",  # FRONTEND PROD
+    ],
+    allow_credentials=False,   # usamos Authorization: Bearer (no cookies)
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],       # CRÍTICO: X-API-Key, Idempotency-Key, Authorization
+    expose_headers=["*"],
 )
 
 @app.post("/stripe/webhook")
