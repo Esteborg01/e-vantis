@@ -1496,7 +1496,7 @@ def price_id_for_plan(plan: str) -> str:
 @app.post("/billing/checkout")
 async def billing_checkout(
     payload: dict,
-    user=Depends(get_current_user),
+    user: dict = Depends(require_user),
 ):
     try:
         # --- Validaciones duras (NO deben escapar como RuntimeError) ---
