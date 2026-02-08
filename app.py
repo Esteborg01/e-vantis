@@ -244,6 +244,16 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
 STRIPE_PRICE_PREMIUM = os.getenv("STRIPE_PRICE_PREMIUM", "")
 
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip().rstrip("/")
+
+def stripe_price_for_plan(plan: str) -> str:
+    plan = (plan or "").strip().lower()
+    if plan == "pro":
+        return STRIPE_PRICE_PRO
+    if plan == "premium":
+        return STRIPE_PRICE_PREMIUM
+    raise ValueError("Plan inválido (pro|premium)")
+
 # Set API key early if provided (startup también lo refuerza)
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -500,6 +510,51 @@ def db_mark_email_verified(user_id: str) -> None:
         )
         conn.commit()
 
+def db_set_stripe_customer(user_id: str, customer_id: str) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE users SET stripe_customer_id=? WHERE user_id=?",
+            (customer_id, user_id),
+        )
+
+def db_set_stripe_subscription(user_id: str, subscription_id: str, status: str | None = None) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE users SET stripe_subscription_id=?, stripe_status=COALESCE(?, stripe_status) WHERE user_id=?",
+            (subscription_id, status, user_id),
+        )
+
+def db_apply_plan_from_stripe(user_id: str, plan: str, is_active: bool, status: str | None = None) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE users SET plan=?, is_active=?, stripe_status=COALESCE(?, stripe_status) WHERE user_id=?",
+            (plan, 1 if is_active else 0, status, user_id),
+        )
+
+def db_get_user_by_id(user_id: str) -> dict | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, email, plan, is_active, email_verified,
+                   stripe_customer_id, stripe_subscription_id, stripe_status
+            FROM users
+            WHERE user_id=?
+            """,
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "user_id": row[0],
+        "email": row[1],
+        "plan": row[2],
+        "is_active": bool(int(row[3] or 0)),
+        "email_verified": bool(int(row[4] or 0)),
+        "stripe_customer_id": row[5],
+        "stripe_subscription_id": row[6],
+        "stripe_status": row[7],
+    }
+
 def _make_verify_link(token: str) -> str:
     base = (EVANTIS_EMAIL_VERIFY_BASE_URL or "").strip().rstrip("/")
     # El frontend puede recibir ?token=... y llamar a backend /auth/verify-email si quieres.
@@ -692,6 +747,23 @@ def db_init():
             conn.execute("UPDATE users SET email_verified=0 WHERE email_verified IS NULL")
         except Exception:
             pass
+
+        # Stripe billing (MVP)
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_status TEXT")
+        except sqlite3.OperationalError:
+            pass
+
 
 
         # ----------------------------
@@ -1528,77 +1600,163 @@ def _user_email_or_400(user: dict) -> str:
 
     return email
 
+class CheckoutRequest(BaseModel):
+    plan: Literal["pro", "premium"]
+
 @app.post("/billing/checkout")
-async def billing_checkout(
-    payload: dict,
-    user: dict = Depends(require_user),
-):
+def billing_checkout(payload: CheckoutRequest, user: dict = Depends(require_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe no configurado (STRIPE_SECRET_KEY)")
+
+    if not FRONTEND_BASE_URL:
+        raise HTTPException(status_code=500, detail="Falta FRONTEND_BASE_URL")
+
+    # (opcional) evitar que free users creen checkout si ya son pro/premium
+    # if user.get("plan") in ("pro", "premium"):
+    #     raise HTTPException(status_code=400, detail="Ya tienes un plan activo")
+
     try:
-        # --- Validaciones duras (NO deben escapar como RuntimeError) ---
-        assert_stripe_ready()
+        price_id = stripe_price_for_plan(payload.plan)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Plan inválido: {e}")
 
-        plan = (payload or {}).get("plan")
-        if plan not in ("pro", "premium"):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Plan inválido. Usa 'pro' o 'premium'."},
-            )
+    # Success/cancel: vuelve al frontend y fuerza refresh de /auth/me
+    success_url = f"{FRONTEND_BASE_URL}/?billing=success&session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{FRONTEND_BASE_URL}/?billing=cancel"
 
-        price_id = (
-            STRIPE_PRICE_PRO if plan == "pro" else STRIPE_PRICE_PREMIUM
-        )
-        if not price_id:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Price ID no configurado para el plan."},
-            )
+    try:
+        # Si ya tenemos customer, lo reutilizamos
+        customer_id = user.get("stripe_customer_id")
+        if not customer_id:
+            # Puedes crear customer explícito para asegurar persistencia
+            cust = stripe.Customer.create(email=user["email"], metadata={"user_id": user["user_id"]})
+            customer_id = cust["id"]
+            db_set_stripe_customer(user["user_id"], customer_id)
 
-        # --- Crear sesión de Stripe ---
         session = stripe.checkout.Session.create(
             mode="subscription",
-            customer_email = _user_email_or_400(user),
+            customer=customer_id,
             line_items=[{"price": price_id, "quantity": 1}],
-            success_url=STRIPE_SUCCESS_URL,
-            cancel_url=STRIPE_CANCEL_URL,
+            success_url=success_url,
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+            subscription_data={
+                "metadata": {
+                    "user_id": user["user_id"],
+                    "plan": payload.plan,
+                }
+            },
             metadata={
                 "user_id": user["user_id"],
-                "plan": plan,
+                "plan": payload.plan,
             },
         )
+        return {"ok": True, "url": session["url"]}
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {getattr(e, 'user_message', str(e))}")
 
-        return {"url": session.url}
+class PortalRequest(BaseModel):
+    return_url: Optional[str] = None
 
-    except Exception as e:
-        # 🔒 NUNCA dejes escapar la excepción
-        print("❌ billing/checkout error:", str(e))
-        return JSONResponse(
-            status_code=500,
-            content={"detail": f"Stripe error: {str(e)}"},
-        )
+@app.post("/billing/portal")
+def billing_portal(payload: PortalRequest, user: dict = Depends(require_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe no configurado (STRIPE_SECRET_KEY)")
 
-@app.post("/billing/portal", response_model=PortalResponse)
-def billing_portal(user: dict = Depends(require_user)):
+    if not FRONTEND_BASE_URL:
+        raise HTTPException(status_code=500, detail="Falta FRONTEND_BASE_URL")
+
+    customer_id = user.get("stripe_customer_id")
+
+    # Fallback si no está guardado (no ideal, pero útil)
+    if not customer_id:
+        try:
+            lst = stripe.Customer.list(email=user["email"], limit=1)
+            if lst and lst.get("data"):
+                customer_id = lst["data"][0]["id"]
+                db_set_stripe_customer(user["user_id"], customer_id)
+        except stripe.error.StripeError:
+            customer_id = None
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="No hay customer Stripe para este usuario (paga o crea checkout primero)")
+
+    return_url = (payload.return_url or FRONTEND_BASE_URL).strip()
     try:
-        assert_stripe_ready()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=return_url,
+        )
+        return {"ok": True, "url": session["url"]}
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {getattr(e, 'user_message', str(e))}")
 
-    u = db_get_user_by_id(user["user_id"])
-    if not u:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
-    email = (u.get("email") or "").strip().lower()
+@app.post("/billing/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook no configurado (STRIPE_WEBHOOK_SECRET)")
 
-    customer_id = get_or_create_customer(user["user_id"], email)
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
 
-    ps = stripe.billing_portal.Session.create(
-        customer=customer_id,
-        return_url=STRIPE_PORTAL_RETURN_URL,
-    )
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
-    url = (ps.get("url") or "").strip()
-    if not url:
-        raise HTTPException(status_code=502, detail="Stripe no devolvió URL de portal.")
-    return PortalResponse(url=url)
+    etype = event["type"]
+    data = event["data"]["object"]
+
+    # 1) Checkout completado (momento ideal para activar plan)
+    if etype == "checkout.session.completed":
+        # data es Checkout Session
+        user_id = (data.get("metadata") or {}).get("user_id")
+        plan = (data.get("metadata") or {}).get("plan")
+        customer_id = data.get("customer")
+        subscription_id = data.get("subscription")
+
+        if user_id and customer_id:
+            db_set_stripe_customer(user_id, customer_id)
+
+        if user_id and subscription_id:
+            db_set_stripe_subscription(user_id, subscription_id, status="active")
+
+        if user_id and plan in ("pro", "premium"):
+            db_apply_plan_from_stripe(user_id, plan=plan, is_active=True, status="active")
+
+    # 2) Subscription updates (cambios de estado)
+    elif etype == "customer.subscription.updated":
+        # data es Subscription
+        subscription_id = data.get("id")
+        status = data.get("status")  # active, past_due, canceled, unpaid...
+        metadata = data.get("metadata") or {}
+        user_id = metadata.get("user_id")
+        plan = metadata.get("plan")
+
+        # Fallback: si no viene metadata, intentar resolver por DB (opcional)
+        if user_id:
+            db_set_stripe_subscription(user_id, subscription_id, status=status)
+            if plan in ("pro", "premium"):
+                is_active = status in ("active", "trialing")
+                db_apply_plan_from_stripe(user_id, plan=plan if is_active else "free", is_active=is_active, status=status)
+
+    elif etype == "customer.subscription.deleted":
+        subscription_id = data.get("id")
+        status = data.get("status")  # usually "canceled"
+        metadata = data.get("metadata") or {}
+        user_id = metadata.get("user_id")
+
+        if user_id:
+            db_set_stripe_subscription(user_id, subscription_id, status=status)
+            db_apply_plan_from_stripe(user_id, plan="free", is_active=False, status=status)
+
+    return {"ok": True}
 
 # ----------------------------
 # Exceptions
