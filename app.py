@@ -297,9 +297,6 @@ def assert_stripe_ready():
 # A3 QA MODE
 # Permite login aunque el correo no esté verificado.
 # ⚠️ SOLO PARA QA / DESARROLLO. En producción debe ser 0.
-EVANTIS_ALLOW_UNVERIFIED_LOGIN = os.getenv(
-    "EVANTIS_ALLOW_UNVERIFIED_LOGIN", "0"
-) == "1"
 
 EVANTIS_EMAIL_VERIFY_ENABLED = os.getenv("EVANTIS_EMAIL_VERIFY_ENABLED", "1") == "1"
 EVANTIS_EMAIL_VERIFY_TTL_SECONDS = int(os.getenv("EVANTIS_EMAIL_VERIFY_TTL_SECONDS", "86400"))  # 24h
@@ -511,25 +508,46 @@ def db_mark_email_verified(user_id: str) -> None:
         conn.commit()
 
 def db_set_stripe_customer(user_id: str, customer_id: str) -> None:
-    with db_connect() as conn:
+    if not customer_id:
+        return
+    with db_conn() as conn:
         conn.execute(
             "UPDATE users SET stripe_customer_id=? WHERE user_id=?",
             (customer_id, user_id),
         )
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
 
 def db_set_stripe_subscription(user_id: str, subscription_id: str, status: str | None = None) -> None:
-    with db_connect() as conn:
+    if not subscription_id:
+        return
+    with db_conn() as conn:
         conn.execute(
             "UPDATE users SET stripe_subscription_id=?, stripe_status=COALESCE(?, stripe_status) WHERE user_id=?",
             (subscription_id, status, user_id),
         )
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
 
 def db_apply_plan_from_stripe(user_id: str, plan: str, is_active: bool, status: str | None = None) -> None:
-    with db_connect() as conn:
+    plan = (plan or "free").strip().lower()
+    if plan not in ("free", "pro", "premium"):
+        plan = "free"
+    with db_conn() as conn:
         conn.execute(
             "UPDATE users SET plan=?, is_active=?, stripe_status=COALESCE(?, stripe_status) WHERE user_id=?",
             (plan, 1 if is_active else 0, status, user_id),
         )
+        try:
+            conn.commit()
+        except Exception:
+            pass
 
 def db_get_user_by_id(user_id: str) -> dict | None:
     with db_connect() as conn:
@@ -748,43 +766,6 @@ def db_init():
         except Exception:
             pass
 
-        # Stripe billing (MVP)
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_status TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-
-
-        # ----------------------------
-        # Stripe fields on users (MVP)
-        # ----------------------------
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
-        except Exception:
-            pass
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT")
-        except Exception:
-            pass
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_status TEXT")
-        except Exception:
-            pass
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN stripe_current_period_end INTEGER")
-        except Exception:
-            pass
 
         # ----------------------------
         # Chat threads + messages
@@ -878,27 +859,6 @@ def db_log_usage(
                 except Exception:
                     print("db_log_usage failed:", repr(e))
             return
-
-def db_get_user_by_id(user_id: str):
-    with db_conn() as conn:
-        cur = conn.execute(
-            """
-            SELECT user_id, email, plan, is_active, email_verified
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "user_id": row[0],
-            "email": row[1],
-            "plan": row[2],
-            "is_active": bool(int(row[3] or 0)),
-            "email_verified": bool(int(row[4] or 0)),
-        }
 
 def db_get_user_by_email(email: str):
     with db_conn() as conn:
@@ -1690,73 +1650,6 @@ def billing_portal(payload: PortalRequest, user: dict = Depends(require_user)):
         return {"ok": True, "url": session["url"]}
     except stripe.error.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Stripe error: {getattr(e, 'user_message', str(e))}")
-
-@app.post("/billing/webhook")
-async def stripe_webhook(request: Request):
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="Webhook no configurado (STRIPE_WEBHOOK_SECRET)")
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=sig_header,
-            secret=STRIPE_WEBHOOK_SECRET,
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    etype = event["type"]
-    data = event["data"]["object"]
-
-    # 1) Checkout completado (momento ideal para activar plan)
-    if etype == "checkout.session.completed":
-        # data es Checkout Session
-        user_id = (data.get("metadata") or {}).get("user_id")
-        plan = (data.get("metadata") or {}).get("plan")
-        customer_id = data.get("customer")
-        subscription_id = data.get("subscription")
-
-        if user_id and customer_id:
-            db_set_stripe_customer(user_id, customer_id)
-
-        if user_id and subscription_id:
-            db_set_stripe_subscription(user_id, subscription_id, status="active")
-
-        if user_id and plan in ("pro", "premium"):
-            db_apply_plan_from_stripe(user_id, plan=plan, is_active=True, status="active")
-
-    # 2) Subscription updates (cambios de estado)
-    elif etype == "customer.subscription.updated":
-        # data es Subscription
-        subscription_id = data.get("id")
-        status = data.get("status")  # active, past_due, canceled, unpaid...
-        metadata = data.get("metadata") or {}
-        user_id = metadata.get("user_id")
-        plan = metadata.get("plan")
-
-        # Fallback: si no viene metadata, intentar resolver por DB (opcional)
-        if user_id:
-            db_set_stripe_subscription(user_id, subscription_id, status=status)
-            if plan in ("pro", "premium"):
-                is_active = status in ("active", "trialing")
-                db_apply_plan_from_stripe(user_id, plan=plan if is_active else "free", is_active=is_active, status=status)
-
-    elif etype == "customer.subscription.deleted":
-        subscription_id = data.get("id")
-        status = data.get("status")  # usually "canceled"
-        metadata = data.get("metadata") or {}
-        user_id = metadata.get("user_id")
-
-        if user_id:
-            db_set_stripe_subscription(user_id, subscription_id, status=status)
-            db_apply_plan_from_stripe(user_id, plan="free", is_active=False, status=status)
-
-    return {"ok": True}
 
 # ----------------------------
 # Exceptions
