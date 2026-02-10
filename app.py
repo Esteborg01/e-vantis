@@ -224,19 +224,44 @@ app = FastAPI(title="E-VANTIS")
 # =========================
 # CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
-ALLOWED_ORIGINS = os.getenv(
-    "EVANTIS_CORS_ORIGINS",
-    "https://evantis-frontend.onrenderer.com,https://evantis-frontend.onrender.com,http://localhost:5173,http://127.0.0.1:5173"
-).split(",")
+FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL", "") or "").strip().rstrip("/")
+
+default_origins = [
+    "https://evantis-frontend.onrender.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if FRONTEND_BASE_URL:
+    default_origins.append(FRONTEND_BASE_URL)
+
+env_origins = (os.getenv("EVANTIS_CORS_ORIGINS", "") or "").strip()
+if env_origins:
+    allowed = [o.strip().rstrip("/") for o in env_origins.split(",") if o.strip()]
+else:
+    allowed = [o.rstrip("/") for o in default_origins]
+
+# Dedup
+allowed = sorted(list({o for o in allowed if o}))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_origins=allowed,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+        "X-API-Key",
+        "Idempotency-Key",
+        "Stripe-Signature",
+    ],
+    expose_headers=["Content-Type"],
 )
+
+print(">>> CORS ALLOWED_ORIGINS =", allowed)
 
 print(">>> LOADED app.py FROM:", __file__)
 app.include_router(curriculum_router)
