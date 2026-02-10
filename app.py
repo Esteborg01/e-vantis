@@ -224,6 +224,28 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
 # ----------------------------
 app = FastAPI(title="E-VANTIS")
 print(">>> LOADED app.py FROM:", __file__)
+
+# =========================
+# CORS — GLOBAL (CRÍTICO)
+# =========================
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "EVANTIS_CORS_ORIGINS",
+        "https://evantis-frontend.onrender.com,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # usamos Authorization: Bearer (no cookies)
+    allow_methods=["*"],
+    allow_headers=["*"],      # Authorization, Content-Type, X-API-Key, etc.
+    expose_headers=["*"],
+)
+
 app.include_router(curriculum_router)
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -1316,26 +1338,6 @@ ALLOWED_ORIGINS = os.getenv(
     "EVANTIS_CORS_ORIGINS",
     "https://evantis-frontend.onrender.com,http://localhost:5173,http://localhost:3000",
 ).split(",")
-
-# ----------------------------
-# CORS (GLOBAL — Frontend Render)
-# Necesario para:
-# - /teach/curriculum (X-API-Key, Idempotency-Key)
-# - /billing/checkout
-# - /billing/portal
-# ----------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://evantis-frontend.onrender.com",  # FRONTEND PROD
-    ],
-    allow_credentials=False,   # usamos Authorization: Bearer (no cookies)
-    allow_methods=["*"],
-    allow_headers=["*"],       # CRÍTICO: X-API-Key, Idempotency-Key, Authorization
-    expose_headers=["*"],
-)
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
