@@ -550,28 +550,27 @@ def db_apply_plan_from_stripe(user_id: str, plan: str, is_active: bool, status: 
             pass
 
 def db_get_user_by_id(user_id: str) -> dict | None:
-    with db_connect() as conn:
-        row = conn.execute(
+    with db_conn() as conn:
+        cur = conn.execute(
             """
-            SELECT user_id, email, plan, is_active, email_verified,
-                   stripe_customer_id, stripe_subscription_id, stripe_status
+            SELECT
+                user_id,
+                email,
+                plan,
+                is_active,
+                email_verified,
+                stripe_customer_id,
+                stripe_subscription_id,
+                stripe_status
             FROM users
-            WHERE user_id=?
+            WHERE user_id = ?
             """,
             (user_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "user_id": row[0],
-        "email": row[1],
-        "plan": row[2],
-        "is_active": bool(int(row[3] or 0)),
-        "email_verified": bool(int(row[4] or 0)),
-        "stripe_customer_id": row[5],
-        "stripe_subscription_id": row[6],
-        "stripe_status": row[7],
-    }
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
 
 def _make_verify_link(token: str) -> str:
     base = (EVANTIS_EMAIL_VERIFY_BASE_URL or "").strip().rstrip("/")
@@ -1684,10 +1683,11 @@ async def http_exception_handler(request, exc):
 
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(request, exc):
+async def global_exception_handler(request: Request, exc: Exception):
+    print("🔥 Unhandled exception:", repr(exc))
     return JSONResponse(
         status_code=500,
-        content={"detail": "Error interno. Revisa logs del servidor."},
+        content={"detail": "Internal server error"},
     )
 
 @app.on_event("startup")
