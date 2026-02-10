@@ -226,7 +226,7 @@ app = FastAPI(title="E-VANTIS")
 # =========================
 ALLOWED_ORIGINS = os.getenv(
     "EVANTIS_CORS_ORIGINS",
-    "https://evantis-frontend.onrender.com,http://localhost:5173,http://127.0.0.1:5173"
+    "https://evantis-frontend.onrenderer.com,https://evantis-frontend.onrender.com,http://localhost:5173,http://127.0.0.1:5173"
 ).split(",")
 
 app.add_middleware(
@@ -234,7 +234,7 @@ app.add_middleware(
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Idempotency-Key"],
+    allow_headers=["*"],
     expose_headers=["*"],
 )
 
