@@ -221,6 +221,10 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
 
 app = FastAPI(title="E-VANTIS")
 
+@app.options("/{path:path}")
+def preflight_handler(path: str):
+    return Response(status_code=204)
+
 # =========================
 # CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
@@ -245,20 +249,16 @@ allowed = sorted(list({o for o in allowed if o}))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=[
         "Authorization",
         "Content-Type",
-        "Accept",
-        "Origin",
-        "X-Requested-With",
         "X-API-Key",
         "Idempotency-Key",
-        "Stripe-Signature",
     ],
-    expose_headers=["Content-Type"],
+    expose_headers=["*"],
 )
 
 print(">>> CORS ALLOWED_ORIGINS =", allowed)
