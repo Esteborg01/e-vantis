@@ -219,33 +219,26 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
                 continue
             raise
 
-# ----------------------------
-# App + env
-# ----------------------------
 app = FastAPI(title="E-VANTIS")
-print(">>> LOADED app.py FROM:", __file__)
 
 # =========================
-# CORS — GLOBAL (CRÍTICO)
+# CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.getenv(
-        "EVANTIS_CORS_ORIGINS",
-        "https://evantis-frontend.onrender.com,http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if o.strip()
-]
+ALLOWED_ORIGINS = os.getenv(
+    "EVANTIS_CORS_ORIGINS",
+    "https://evantis-frontend.onrender.com,http://localhost:5173,http://127.0.0.1:5173"
+).split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,  # usamos Authorization: Bearer (no cookies)
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],      # Authorization, Content-Type, X-API-Key, etc.
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Idempotency-Key"],
     expose_headers=["*"],
 )
 
+print(">>> LOADED app.py FROM:", __file__)
 app.include_router(curriculum_router)
 
 bearer_scheme = HTTPBearer(auto_error=False)
