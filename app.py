@@ -249,19 +249,14 @@ allowed = sorted(list({o for o in allowed if o}))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,
+    allow_origins=allowed,          # <-- CLAVE: usa "allowed"
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Authorization",
-        "Content-Type",
-        "X-API-Key",
-        "Idempotency-Key",
-    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
     expose_headers=["*"],
 )
 
-print(">>> CORS ALLOWED_ORIGINS =", allowed)
+print(">>> CORS allowed =", allowed)
 
 print(">>> LOADED app.py FROM:", __file__)
 app.include_router(curriculum_router)
