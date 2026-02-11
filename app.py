@@ -602,11 +602,11 @@ def db_get_user_by_id(user_id: str) -> dict | None:
         if not row:
             return None
 
-        # ✅ Compatible con sqlite3.Row o tuple
+        # ✅ Soporta tanto sqlite3.Row como tuplas
         if isinstance(row, sqlite3.Row):
             return dict(row)
 
-        cols = [d[0] for d in cur.description]
+        cols = [d[0] for d in (cur.description or [])]
         return dict(zip(cols, row))
 
 def _make_verify_link(token: str) -> str:
