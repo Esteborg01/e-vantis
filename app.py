@@ -1101,19 +1101,22 @@ def require_user(token: str = Depends(oauth2_scheme)) -> dict:
     u = db_get_user_by_id(user_id)
     if not u or not u["is_active"]:
         raise HTTPException(status_code=401, detail="Usuario no activo.")
-
     if not db_is_session_active(user_id, jti):
         raise HTTPException(status_code=401, detail="Sesión inválida o revocada.")
 
     db_touch_session_last_seen(user_id, jti)
 
-    # Fuente de verdad del plan: DB (no confíes en token si después cambias plan)
     plan_db = (u.get("plan") or "free").strip().lower()
     if plan_db not in ("free", "pro", "premium"):
         plan_db = "free"
 
-    return {"user_id": user_id, "plan": plan_db}
-
+    return {
+        "user_id": user_id,
+        "plan": plan_db,
+        "email": (u.get("email") or "").strip().lower(),
+        "stripe_customer_id": (u.get("stripe_customer_id") or "").strip() if u.get("stripe_customer_id") else None,
+        "stripe_subscription_id": (u.get("stripe_subscription_id") or "").strip() if u.get("stripe_subscription_id") else None,
+    }
 
 def require_plan(min_plan: Plan, user: dict = Depends(require_user)) -> dict:
     order = {"free": 0, "pro": 1, "premium": 2}
@@ -1339,59 +1342,6 @@ def require_admin(x_api_key: str = Depends(require_student_or_admin)) -> str:
         raise HTTPException(status_code=403, detail="Requiere rol admin")
     return x_api_key
 
-
-# ----------------------------
-# CORS
-# ----------------------------
-ALLOWED_ORIGINS = os.getenv(
-    "EVANTIS_CORS_ORIGINS",
-    "https://evantis-frontend.onrender.com,http://localhost:5173,http://localhost:3000",
-).split(",")
-
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("Stripe-Signature")
-
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Stripe webhook no configurado (falta STRIPE_WEBHOOK_SECRET)"
-        )
-
-    if not sig_header:
-        raise HTTPException(status_code=400, detail="Missing Stripe signature")
-
-    # Verificación de firma (seguridad)
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=sig_header,
-            secret=STRIPE_WEBHOOK_SECRET
-        )
-    except Exception as e:
-        print("[STRIPE_WEBHOOK] signature_error:", repr(e))
-        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
-
-
-    # Anti-mezcla TEST / LIVE (seguridad operativa)
-    if STRIPE_MODE == "test" and event.get("livemode") is True:
-        raise HTTPException(status_code=400, detail="Evento LIVE en backend TEST")
-
-    if STRIPE_MODE == "live" and event.get("livemode") is False:
-        raise HTTPException(status_code=400, detail="Evento TEST en backend LIVE")
-
-    # Idempotencia
-    event_id = event.get("id") or ""
-    if not event_id:
-        return {"ok": True}
-
-    if not db_register_stripe_event(event_id):
-        return {"ok": True, "duplicate": True}
-
-    event_type = (event.get("type") or "").strip()
-    obj = (event.get("data") or {}).get("object") or {}
-
     # ----------------------------
     # Subscription lifecycle
     # ----------------------------
@@ -1477,9 +1427,6 @@ async def stripe_webhook(request: Request):
 STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", EVANTIS_APP_URL.rstrip("/") + "/billing/success")
 STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", EVANTIS_APP_URL.rstrip("/") + "/billing/cancel")
 STRIPE_PORTAL_RETURN_URL = os.getenv("STRIPE_PORTAL_RETURN_URL", EVANTIS_APP_URL.rstrip("/") + "/account")
-
-class CheckoutRequest(BaseModel):
-    plan: Literal["pro", "premium"]
 
 class CheckoutResponse(BaseModel):
     url: str
@@ -1599,7 +1546,10 @@ def billing_checkout(payload: CheckoutRequest, user: dict = Depends(require_user
         customer_id = user.get("stripe_customer_id")
         if not customer_id:
             # Puedes crear customer explícito para asegurar persistencia
-            cust = stripe.Customer.create(email=user["email"], metadata={"user_id": user["user_id"]})
+            cust = stripe.Customer.create(
+                email=user["email"],
+                metadata={"evantis_user_id": user["user_id"], "evantis_env": STRIPE_MODE},
+            )
             customer_id = cust["id"]
             db_set_stripe_customer(user["user_id"], customer_id)
 
