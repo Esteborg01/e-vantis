@@ -662,7 +662,7 @@ def db_conn():
         check_same_thread=False,
         isolation_level=None,
     )
-    conn.row_factory = sqlite3.Row  # ✅ CLAVE: permite dict(row)
+    conn.row_factory = sqlite3.Row  # ✅ CLAVE: permite dict(row) y acceso por nombre
 
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -1106,6 +1106,7 @@ def require_user(token: str = Depends(oauth2_scheme)) -> dict:
 
     db_touch_session_last_seen(user_id, jti)
 
+    # Fuente de verdad del plan: DB
     plan_db = (u.get("plan") or "free").strip().lower()
     if plan_db not in ("free", "pro", "premium"):
         plan_db = "free"
@@ -1114,8 +1115,10 @@ def require_user(token: str = Depends(oauth2_scheme)) -> dict:
         "user_id": user_id,
         "plan": plan_db,
         "email": (u.get("email") or "").strip().lower(),
-        "stripe_customer_id": (u.get("stripe_customer_id") or "").strip() if u.get("stripe_customer_id") else None,
-        "stripe_subscription_id": (u.get("stripe_subscription_id") or "").strip() if u.get("stripe_subscription_id") else None,
+        "stripe_customer_id": (u.get("stripe_customer_id") or None),
+        "stripe_subscription_id": (u.get("stripe_subscription_id") or None),
+        "stripe_status": (u.get("stripe_status") or None),
+        "is_active": bool(int(u.get("is_active") or 0)),
     }
 
 def require_plan(min_plan: Plan, user: dict = Depends(require_user)) -> dict:
