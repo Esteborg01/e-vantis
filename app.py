@@ -650,13 +650,21 @@ def send_verify_email(email: str, token: str) -> str:
         return link
 
 def db_conn():
-    # Autocommit reduce locks largos (cada statement se confirma al vuelo)
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30,
         check_same_thread=False,
-        isolation_level=None,  # <- CLAVE (autocommit)
+        isolation_level=None,
     )
+
+    conn.row_factory = sqlite3.Row   # ✅ ESTA LÍNEA FALTA
+
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+
+    return conn
 
     # WAL: 1 writer + múltiples readers (mejor concurrencia)
     conn.execute("PRAGMA journal_mode=WAL;")
