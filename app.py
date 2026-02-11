@@ -221,10 +221,6 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
 
 app = FastAPI(title="E-VANTIS")
 
-@app.options("/{path:path}")
-def preflight_handler(path: str):
-    return Response(status_code=204)
-
 # =========================
 # CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
@@ -245,14 +241,14 @@ else:
     allowed = [o.rstrip("/") for o in default_origins]
 
 # Dedup
-allowed = sorted(list({o for o in allowed if o}))
+allowed = sorted({o for o in allowed if o})
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,          # <-- CLAVE: usa "allowed"
+    allow_origins=allowed,              # ✅ ESTA es la lista correcta
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],                # ✅ incluye Authorization/X-API-Key/Idempotency-Key
     expose_headers=["*"],
 )
 
