@@ -225,9 +225,9 @@ app = FastAPI(title="E-VANTIS")
 # CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
 FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL", "") or "").strip().rstrip("/")
-
 default_origins = [
     "https://evantis-frontend.onrender.com",
+    "https://evantis-frontend.onrenderer.com",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
