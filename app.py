@@ -601,7 +601,13 @@ def db_get_user_by_id(user_id: str) -> dict | None:
         row = cur.fetchone()
         if not row:
             return None
-        return dict(row)
+
+        # ✅ Compatible con sqlite3.Row o tuple
+        if isinstance(row, sqlite3.Row):
+            return dict(row)
+
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
 
 def _make_verify_link(token: str) -> str:
     base = (EVANTIS_EMAIL_VERIFY_BASE_URL or "").strip().rstrip("/")
@@ -656,27 +662,13 @@ def db_conn():
         check_same_thread=False,
         isolation_level=None,
     )
-
-    conn.row_factory = sqlite3.Row   # ✅ ESTA LÍNEA FALTA
+    conn.row_factory = sqlite3.Row  # ✅ CLAVE: permite dict(row)
 
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
-
     return conn
-
-    # WAL: 1 writer + múltiples readers (mejor concurrencia)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-
-    # Si la DB está ocupada, espera antes de fallar (ms)
-    conn.execute("PRAGMA busy_timeout=5000;")  # 5s
-
-    # Buenas prácticas
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
-
 
 def db_init():
     with db_conn() as conn:
