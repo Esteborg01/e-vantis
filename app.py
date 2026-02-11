@@ -715,7 +715,16 @@ def db_init():
             plan TEXT NOT NULL DEFAULT 'free',
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
-            last_login_at TEXT
+            last_login_at TEXT,
+
+            email_verified INTEGER NOT NULL DEFAULT 0,
+            email_verify_token TEXT,
+            email_verify_expires_at INTEGER,
+
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            stripe_status TEXT,
+            stripe_current_period_end INTEGER
         )
         """)
         conn.execute("""
@@ -796,6 +805,25 @@ def db_init():
         except Exception:
             pass
 
+                # ----------------------------
+        # Stripe columns (MVP)
+        # ----------------------------
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_status TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_current_period_end INTEGER")
+        except Exception:
+            pass
 
         # ----------------------------
         # Chat threads + messages
@@ -1545,10 +1573,18 @@ def billing_checkout(payload: CheckoutRequest, user: dict = Depends(require_user
     cancel_url = f"{FRONTEND_BASE_URL}/?billing=cancel"
 
     try:
-        # Si ya tenemos customer, lo reutilizamos
         customer_id = user.get("stripe_customer_id")
+
+        # Si tenemos customer_id, verifica que exista en el modo actual
+        if customer_id:
+            try:
+                stripe.Customer.retrieve(customer_id)
+            except stripe.error.InvalidRequestError as e:
+                # típico: "No such customer" por mezcla test/live o customer borrado
+                customer_id = None
+
+        # Si no existe o falló, crea uno nuevo
         if not customer_id:
-            # Puedes crear customer explícito para asegurar persistencia
             cust = stripe.Customer.create(
                 email=user["email"],
                 metadata={"evantis_user_id": user["user_id"], "evantis_env": STRIPE_MODE},
