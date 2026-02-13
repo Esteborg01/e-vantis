@@ -34,6 +34,11 @@ from openai import OpenAI
 
 from routes_curriculum import router as curriculum_router
 
+# =========================
+# LOAD .env EARLY (MUST BE BEFORE os.getenv)
+# =========================
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 
 # ----------------------------
 # Quotas por plan / módulo (FASE 8)
@@ -260,15 +265,12 @@ app.include_router(curriculum_router)
 bearer_scheme = HTTPBearer(auto_error=False)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # =========================
 # STRIPE CONFIG (GLOBAL)
 # =========================
-STRIPE_MODE = os.getenv("STRIPE_MODE", "test").strip().lower()  # "test" o "live"
+STRIPE_MODE = os.getenv("STRIPE_MODE", "live").strip().lower()  # "test" o "live"
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
@@ -340,6 +342,12 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1") == "1"
 
+print(">>> SMTP_HOST =", SMTP_HOST)
+print(">>> SMTP_PORT =", SMTP_PORT)
+print(">>> SMTP_USER =", SMTP_USER)
+print(">>> SMTP_USE_TLS =", SMTP_USE_TLS)
+print(">>> EVANTIS_EMAIL_FROM =", EVANTIS_EMAIL_FROM)
+
 # URL base para verificación: frontend o backend. Ej:
 # https://evantis-frontend.onrender.com/verify-email
 # o https://e-vantis-api.onrender.com/auth/verify-email (si lo manejas en backend)
@@ -360,6 +368,15 @@ EVANTIS_RETURN_VERIFY_LINK = os.getenv("EVANTIS_RETURN_VERIFY_LINK", "0") == "1"
 # Si =1, permite login aunque el correo no esté verificado (solo QA).
 # En prod real: dejar en 0.
 EVANTIS_ALLOW_UNVERIFIED_LOGIN = os.getenv("EVANTIS_ALLOW_UNVERIFIED_LOGIN", "0") == "1"
+
+# ----------------------------
+# Password reset config
+# ----------------------------
+EVANTIS_RESET_PW_TTL_SECONDS = int(os.getenv("EVANTIS_RESET_PW_TTL_SECONDS", "3600"))  # 1h
+EVANTIS_RESET_PW_BASE_URL = os.getenv(
+    "EVANTIS_RESET_PW_BASE_URL",
+    EVANTIS_APP_URL.rstrip("/") + "/reset-password"
+)
 
 # ----------------------------
 # SQLite config (define BEFORE functions that use DB_PATH)
@@ -476,6 +493,11 @@ def require_auth(
         )
     return decode_access_token(credentials.credentials)
 
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def _new_token(prefix: str = "evr") -> str:
+    return f"{prefix}_{secrets.token_urlsafe(32)}"
 
 # ----------------------------
 # DB helpers
@@ -654,6 +676,74 @@ def send_verify_email(email: str, token: str) -> str:
         # Si falla SMTP, no bloquees MVP: imprime link y listo
         print(f"[EMAIL_VERIFY_FALLBACK] smtp_failed={repr(e)} email={email} link={link}")
         return link
+
+def _make_reset_pw_link(token: str) -> str:
+    base = (EVANTIS_RESET_PW_BASE_URL or "").strip().rstrip("/")
+    return f"{base}?token={token}"
+
+def send_reset_password_email(email: str, token: str) -> str:
+    link = _make_reset_pw_link(token)
+
+    if not SMTP_HOST:
+        print(f"[RESET_PW_LINK] email={email} link={link}")
+        return link
+
+    try:
+        import smtplib
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["Subject"] = "Restablece tu contraseña — E-Vantis"
+        msg["From"] = EVANTIS_EMAIL_FROM
+        msg["To"] = email
+        msg.set_content(
+            "Recibimos una solicitud para restablecer tu contraseña.\n\n"
+            f"Enlace (expira en {EVANTIS_RESET_PW_TTL_SECONDS//60} min):\n{link}\n\n"
+            "Si no solicitaste esto, ignora este correo."
+        )
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+
+        return link
+    except Exception as e:
+        print(f"[RESET_PW_FALLBACK] smtp_failed={repr(e)} email={email} link={link}")
+        return link
+
+def db_set_reset_pw_token(user_id: str, token_hash: str, expires_at: int) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET reset_pw_token_hash=?, reset_pw_expires_at=? WHERE user_id=?",
+            (token_hash, int(expires_at), user_id),
+        )
+        conn.commit()
+
+def db_get_user_by_reset_pw_token(token_hash: str):
+    with db_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT user_id, email, reset_pw_expires_at
+            FROM users
+            WHERE reset_pw_token_hash=?
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"user_id": row[0], "email": row[1], "expires_at": int(row[2] or 0)}
+
+def db_clear_reset_pw_token(user_id: str) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET reset_pw_token_hash=NULL, reset_pw_expires_at=NULL WHERE user_id=?",
+            (user_id,),
+        )
+        conn.commit()
 
 def db_conn():
     conn = sqlite3.connect(
@@ -2625,6 +2715,9 @@ class RegisterResponse(BaseModel):
     email: str
     verify_link: Optional[str] = None  # solo para MVP/logs
 
+class ResendVerificationRequest(BaseModel):
+    email: str
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -2664,6 +2757,15 @@ class TeachCurriculumIn(BaseModel):
 
     editorial_v1: StrictBool = False
 
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str
+
+class ResendVerifyIn(BaseModel):
+    email: str
 
 # ----------------------------
 # Helpers: curriculum, slug, subtopics
@@ -2940,6 +3042,44 @@ def register(req: RegisterRequest):
     db_mark_email_verified(user_id)
     return RegisterResponse(ok=True, status="registered", email=email, verify_link=None)
 
+@app.post("/auth/resend-verification")
+def resend_verification(req: ResendVerificationRequest):
+    """
+    Reenvía enlace de verificación (si el email existe y NO está verificado).
+    Respuesta siempre es genérica para evitar enumeración de usuarios.
+    """
+    email = (req.email or "").strip().lower()
+    if "@" not in email or "." not in email:
+        # Respuesta genérica (no revelar nada)
+        return {"ok": True, "status": "sent_if_exists"}
+
+    # Si la verificación por email está desactivada, no hacemos nada
+    if not EVANTIS_EMAIL_VERIFY_ENABLED:
+        return {"ok": True, "status": "sent_if_exists"}
+
+    user = db_get_user_by_email(email)
+    if not user:
+        # No revelar si existe o no
+        return {"ok": True, "status": "sent_if_exists"}
+
+    if bool(user.get("email_verified", False)):
+        # Ya verificado: tampoco revelar mucho
+        return {"ok": True, "status": "already_verified"}
+
+    # Generar NUEVO token y refrescar expiración
+    token = "evv_" + secrets.token_urlsafe(24)
+    expires_at = int(time.time()) + EVANTIS_EMAIL_VERIFY_TTL_SECONDS
+
+    db_set_email_verification(user_id=user["user_id"], token=token, expires_at=expires_at)
+
+    try:
+        send_verify_email(email=email, token=token)
+    except Exception:
+        # No revelar fallas internas al cliente
+        return {"ok": True, "status": "sent_if_exists"}
+
+    return {"ok": True, "status": "sent_if_exists"}
+
 @app.post("/auth/login", response_model=TokenResponse)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = None):
     email = (form_data.username or "").strip().lower()
@@ -3006,6 +3146,84 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
     token = create_access_token(user_id=user["user_id"], plan=plan, sid=sid, jti=jti)  # type: ignore[arg-type]
     return TokenResponse(access_token=token, token_type="bearer", plan=plan)
 
+@app.post("/auth/forgot-password")
+def forgot_password(body: ForgotPasswordIn):
+    email = (body.email or "").strip().lower()
+
+    # respuesta genérica (anti-enumeración)
+    generic = {"ok": True, "message": "Si el correo existe, enviaremos un enlace para restablecer tu contraseña."}
+
+    try:
+        u = db_get_user_by_email(email)
+        if not u:
+            return generic
+
+        print(f"[RESET_PW] attempt_send email={email} via_smtp={'yes' if SMTP_HOST else 'no'}")
+
+        token = _new_token("evrpw")
+        token_hash = _token_hash(token)
+        expires_at = int(time.time()) + EVANTIS_RESET_PW_TTL_SECONDS
+
+        db_set_reset_pw_token(u["user_id"], token_hash, expires_at)
+        send_reset_password_email(u["email"], token)
+
+        return generic
+
+    except Exception as e:
+        print("[RESET_PW] send_failed:", repr(e))
+        # no revelar errores al usuario
+        return generic
+
+@app.post("/auth/reset-password")
+def reset_password(body: ResetPasswordIn):
+    token = (body.token or "").strip()
+    new_password = body.new_password or ""
+
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password demasiado corto (mínimo 8).")
+    if len(new_password.encode("utf-8")) > 128:
+        raise HTTPException(status_code=400, detail="Password demasiado largo (máximo 128 bytes).")
+
+    token_hash = _token_hash(token)
+    u = db_get_user_by_reset_pw_token(token_hash)
+    if not u:
+        raise HTTPException(status_code=400, detail="Token inválido o expirado.")
+
+    if int(u["expires_at"]) < int(time.time()):
+        db_clear_reset_pw_token(u["user_id"])
+        raise HTTPException(status_code=400, detail="Token inválido o expirado.")
+
+    new_hash = hash_password(new_password)
+
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE user_id=?",
+            (new_hash, u["user_id"]),
+        )
+        conn.commit()
+
+    db_clear_reset_pw_token(u["user_id"])
+    return {"ok": True, "message": "Contraseña actualizada. Ya puedes iniciar sesión."}
+
+@app.post("/auth/resend-verify")
+def resend_verify(body: ResendVerifyIn):
+    email = (body.email or "").strip().lower()
+    generic = {"ok": True, "message": "Si el correo existe, reenviamos el enlace de verificación."}
+
+    u = db_get_user_by_email(email)
+    if not u:
+        return generic
+
+    # Si ya está verificado, no hacemos nada
+    if bool(u.get("email_verified", False)):
+        return generic
+
+    token = _new_token("evv")
+    expires_at = int(time.time()) + EVANTIS_EMAIL_VERIFY_TTL_SECONDS
+    db_set_email_verification(u["user_id"], token, expires_at)
+    send_verify_email(u["email"], token)
+
+    return generic
 
 # ----------------------------
 # Admin keys
