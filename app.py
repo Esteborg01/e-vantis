@@ -3174,6 +3174,15 @@ def forgot_password(body: ForgotPasswordIn):
         # no revelar errores al usuario
         return generic
 
+# --- Alias legacy: /auth/request-reset -> /auth/forgot-password ---
+@app.post("/auth/request-reset")
+def request_reset_alias(body: ForgotPasswordIn):
+    """
+    Alias de compatibilidad:
+    /auth/request-reset == /auth/forgot-password
+    """
+    return forgot_password(body)
+
 @app.post("/auth/reset-password")
 def reset_password(body: ResetPasswordIn):
     token = (body.token or "").strip()
