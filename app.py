@@ -3183,6 +3183,32 @@ def request_reset_alias(body: ForgotPasswordIn):
     """
     return forgot_password(body)
 
+@app.get("/auth/reset-password-status")
+def reset_password_status(token: str):
+    """
+    Valida si un token de reset password sigue vigente (existe y no expiró).
+    No revela info sensible (solo ok/valid).
+    """
+    token = (token or "").strip()
+    if not token or len(token) < 16:
+        raise HTTPException(status_code=400, detail="Token inválido o expirado.")
+
+    token_hash = _token_hash(token)
+    u = db_get_user_by_reset_pw_token(token_hash)
+    if not u:
+        raise HTTPException(status_code=400, detail="Token inválido o expirado.")
+
+    expires_at = int(u.get("expires_at") or 0)
+    if expires_at and int(time.time()) > expires_at:
+        # limpia si ya expiró
+        try:
+            db_clear_reset_pw_token(u["user_id"])
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Token inválido o expirado.")
+
+    return {"ok": True, "valid": True}
+
 @app.post("/auth/reset-password")
 def reset_password(body: ResetPasswordIn):
     token = (body.token or "").strip()
