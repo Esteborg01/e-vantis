@@ -745,6 +745,20 @@ def db_clear_reset_pw_token(user_id: str) -> None:
         )
         conn.commit()
 
+def db_revoke_all_sessions_for_user(user_id: str) -> int:
+    """
+    Revoca TODAS las sesiones activas del usuario.
+    Retorna cantidad de sesiones borradas.
+    """
+    conn = db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
 def db_conn():
     conn = sqlite3.connect(
         DB_PATH,
@@ -3238,6 +3252,8 @@ def reset_password(body: ResetPasswordIn):
         conn.commit()
 
     db_clear_reset_pw_token(u["user_id"])
+    # 🔥 NUEVO: revocar TODAS las sesiones activas del usuario
+    revoked = db_revoke_all_sessions_for_user(u["user_id"])
     return {"ok": True, "message": "Contraseña actualizada. Ya puedes iniciar sesión."}
 
 @app.post("/auth/resend-verify")
