@@ -239,21 +239,49 @@ default_origins = [
 if FRONTEND_BASE_URL:
     default_origins.append(FRONTEND_BASE_URL)
 
-env_origins = (os.getenv("EVANTIS_CORS_ORIGINS", "") or "").strip()
-if env_origins:
-    allowed = [o.strip().rstrip("/") for o in env_origins.split(",") if o.strip()]
-else:
-    allowed = [o.rstrip("/") for o in default_origins]
+def _parse_cors_origins(raw: str) -> list[str]:
+    if not raw:
+        return []
+    raw = raw.strip()
+    out: list[str] = []
+    try:
+        if raw.startswith("["):
+            arr = json.loads(raw)
+            if isinstance(arr, list):
+                out = [str(x).strip() for x in arr]
+        else:
+            parts: list[str] = []
+            for line in raw.splitlines():
+                parts.extend(line.split(","))
+            out = [p.strip() for p in parts if p.strip()]
+    except Exception:
+        parts = raw.replace("\n", ",").split(",")
+        out = [p.strip() for p in parts if p.strip()]
 
-# Dedup
+    norm: list[str] = []
+    seen = set()
+    for o in out:
+        o2 = o[:-1] if o.endswith("/") else o
+        if o2 and o2 not in seen:
+            seen.add(o2)
+            norm.append(o2)
+    return norm
+
+
+env_origins = (os.getenv("EVANTIS_CORS_ORIGINS", "") or "").strip()
+parsed = _parse_cors_origins(env_origins)
+
+allowed = parsed or [o.rstrip("/") for o in default_origins]
 allowed = sorted({o for o in allowed if o})
+
+print(">>> CORS allowed =", allowed)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed,              # ✅ ESTA es la lista correcta
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],                # ✅ incluye Authorization/X-API-Key/Idempotency-Key
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Idempotency-Key"],
     expose_headers=["*"],
 )
 
@@ -747,17 +775,16 @@ def db_clear_reset_pw_token(user_id: str) -> None:
 
 def db_revoke_all_sessions_for_user(user_id: str) -> int:
     """
-    Revoca TODAS las sesiones activas del usuario.
-    Retorna cantidad de sesiones borradas.
+    Revoca TODAS las sesiones activas del usuario (JWT sessions).
+    Retorna cuántas sesiones fueron desactivadas.
     """
-    conn = db_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    with db_conn() as conn:
+        cur = conn.execute(
+            "UPDATE user_sessions SET is_active=0 WHERE user_id=? AND is_active=1",
+            (user_id,),
+        )
         conn.commit()
-        return cur.rowcount or 0
-    finally:
-        conn.close()
+        return int(cur.rowcount or 0)
 
 def db_conn():
     conn = sqlite3.connect(
@@ -3252,9 +3279,13 @@ def reset_password(body: ResetPasswordIn):
         conn.commit()
 
     db_clear_reset_pw_token(u["user_id"])
-    # 🔥 NUEVO: revocar TODAS las sesiones activas del usuario
+
     revoked = db_revoke_all_sessions_for_user(u["user_id"])
-    return {"ok": True, "message": "Contraseña actualizada. Ya puedes iniciar sesión."}
+    return {
+        "ok": True,
+        "message": "Contraseña actualizada. Se cerraron todas tus sesiones. Inicia sesión de nuevo.",
+        "revoked_sessions": revoked,
+    }
 
 @app.post("/auth/resend-verify")
 def resend_verify(body: ResendVerifyIn):
