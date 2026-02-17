@@ -34,6 +34,8 @@ from openai import OpenAI
 
 from routes_curriculum import router as curriculum_router
 
+from services.email_provider import send_verify_email, send_reset_password_email
+
 # =========================
 # LOAD .env EARLY (MUST BE BEFORE os.getenv)
 # =========================
@@ -363,19 +365,6 @@ EVANTIS_EMAIL_VERIFY_ENABLED = os.getenv("EVANTIS_EMAIL_VERIFY_ENABLED", "1") ==
 EVANTIS_EMAIL_VERIFY_TTL_SECONDS = int(os.getenv("EVANTIS_EMAIL_VERIFY_TTL_SECONDS", "86400"))  # 24h
 EVANTIS_EMAIL_FROM = os.getenv("EVANTIS_EMAIL_FROM", "no-reply@evantis.local")
 
-# Si NO tienes proveedor de correo, deja SMTP_HOST vacío y se imprimirá el link en logs.
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1") == "1"
-
-print(">>> SMTP_HOST =", SMTP_HOST)
-print(">>> SMTP_PORT =", SMTP_PORT)
-print(">>> SMTP_USER =", SMTP_USER)
-print(">>> SMTP_USE_TLS =", SMTP_USE_TLS)
-print(">>> EVANTIS_EMAIL_FROM =", EVANTIS_EMAIL_FROM)
-
 # URL base para verificación: frontend o backend. Ej:
 # https://evantis-frontend.onrender.com/verify-email
 # o https://e-vantis-api.onrender.com/auth/verify-email (si lo manejas en backend)
@@ -664,83 +653,9 @@ def _make_verify_link(token: str) -> str:
     # El frontend puede recibir ?token=... y llamar a backend /auth/verify-email si quieres.
     return f"{base}?token={token}"
 
-
-def send_verify_email(email: str, token: str) -> str:
-    """
-    En producción: envía correo si hay SMTP.
-    Sin proveedor: imprime el link en logs y regresa el link.
-    """
-    link = _make_verify_link(token)
-
-    # Fallback: sin SMTP → imprimir link (MVP)
-    if not SMTP_HOST:
-        print(f"[EMAIL_VERIFY_LINK] email={email} link={link}")
-        return link
-
-    # SMTP simple (opcional)
-    try:
-        import smtplib
-        from email.message import EmailMessage
-
-        msg = EmailMessage()
-        msg["Subject"] = "Verifica tu correo — E-Vantis"
-        msg["From"] = EVANTIS_EMAIL_FROM
-        msg["To"] = email
-        msg.set_content(
-            "Verifica tu correo para activar tu cuenta.\n\n"
-            f"Link de verificación:\n{link}\n\n"
-            "Si no solicitaste esto, ignora este correo."
-        )
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            if SMTP_USE_TLS:
-                server.starttls()
-            if SMTP_USER and SMTP_PASS:
-                server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-
-        return link
-    except Exception as e:
-        # Si falla SMTP, no bloquees MVP: imprime link y listo
-        print(f"[EMAIL_VERIFY_FALLBACK] smtp_failed={repr(e)} email={email} link={link}")
-        return link
-
 def _make_reset_pw_link(token: str) -> str:
     base = (EVANTIS_RESET_PW_BASE_URL or "").strip().rstrip("/")
     return f"{base}?token={token}"
-
-def send_reset_password_email(email: str, token: str) -> str:
-    link = _make_reset_pw_link(token)
-
-    if not SMTP_HOST:
-        print(f"[RESET_PW_LINK] email={email} link={link}")
-        return link
-
-    try:
-        import smtplib
-        from email.message import EmailMessage
-
-        msg = EmailMessage()
-        msg["Subject"] = "Restablece tu contraseña — E-Vantis"
-        msg["From"] = EVANTIS_EMAIL_FROM
-        msg["To"] = email
-        msg.set_content(
-            "Recibimos una solicitud para restablecer tu contraseña.\n\n"
-            f"Enlace (expira en {EVANTIS_RESET_PW_TTL_SECONDS//60} min):\n{link}\n\n"
-            "Si no solicitaste esto, ignora este correo."
-        )
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            if SMTP_USE_TLS:
-                server.starttls()
-            if SMTP_USER and SMTP_PASS:
-                server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-
-        return link
-    except Exception as e:
-        print(f"[RESET_PW_FALLBACK] smtp_failed={repr(e)} email={email} link={link}")
-        return link
 
 def db_set_reset_pw_token(user_id: str, token_hash: str, expires_at: int) -> None:
     with db_conn() as conn:
@@ -3191,7 +3106,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
 def forgot_password(body: ForgotPasswordIn):
     email = (body.email or "").strip().lower()
 
-    # respuesta genérica (anti-enumeración)
     generic = {"ok": True, "message": "Si el correo existe, enviaremos un enlace para restablecer tu contraseña."}
 
     try:
@@ -3199,20 +3113,21 @@ def forgot_password(body: ForgotPasswordIn):
         if not u:
             return generic
 
-        print(f"[RESET_PW] attempt_send email={email} via_smtp={'yes' if SMTP_HOST else 'no'}")
+        print(f"[RESET_PW] attempt_send email={email} via_provider=resend")
 
         token = _new_token("evrpw")
         token_hash = _token_hash(token)
         expires_at = int(time.time()) + EVANTIS_RESET_PW_TTL_SECONDS
 
         db_set_reset_pw_token(u["user_id"], token_hash, expires_at)
+
+        # ✅ wrapper centralizado (mail_provider.py)
         send_reset_password_email(u["email"], token)
 
         return generic
 
     except Exception as e:
         print("[RESET_PW] send_failed:", repr(e))
-        # no revelar errores al usuario
         return generic
 
 # --- Alias legacy: /auth/request-reset -> /auth/forgot-password ---
