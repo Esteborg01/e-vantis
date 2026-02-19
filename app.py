@@ -3446,12 +3446,33 @@ def teach_curriculum(
         if level == "auto":
             level = subject.get("level_default") or "pregrado"
 
-        npm_profile = (subject.get("npm_profile") or "").lower()
-        PROFILE_ALIASES = {"clinico": "clinicas", "basica": "basicas"}
+        npm_profile = (subject.get("npm_profile") or "").strip().lower()
+
+        # Normalización + aliases
+        PROFILE_ALIASES = {
+            # básicos
+            "basica": "basicas",
+            "basicas": "basicas",
+
+            # puente
+            "puente": "puente",
+
+            # clínico (tus reglas)
+            "clinico": "clinicas",
+            "clínico": "clinicas",
+            "clinicas": "clinicas",
+
+            # puente-clínico -> lo tratamos como clínico (por tu política de "todo clínico")
+            "puente-clinico": "clinicas",
+            "puente_clinico": "clinicas",
+            "puenteclinico": "clinicas",
+        }
+
         npm_profile = PROFILE_ALIASES.get(npm_profile, npm_profile)
 
+        # Si llega algo raro, debe ser 422 (input inválido), no 500
         if npm_profile not in ("basicas", "puente", "clinicas"):
-            raise HTTPException(status_code=500, detail=f"NPM profile no reconocido: {npm_profile}")
+            raise HTTPException(status_code=422, detail=f"NPM profile no reconocido: {npm_profile}")
 
         # ----------------------------
         # Encontrar topic (macro_topic)
