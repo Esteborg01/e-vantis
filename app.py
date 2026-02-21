@@ -46,9 +46,9 @@ load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 # Quotas por plan / módulo (FASE 8)
 # ----------------------------
 QUOTAS = {
-    "free": {"lesson": 10, "exam": 5, "enarm": 0, "gpc_summary": 0},
-    "pro": {"lesson": 250, "exam": 150, "enarm": 100, "gpc_summary": 50},
-    "premium": {"lesson": 1000, "exam": 500, "enarm": 300, "gpc_summary": 300},
+    "free": {"lesson": 10, "exam": 5, "exam_clinico": 0, "gpc_summary": 0},
+    "pro": {"lesson": 250, "exam": 150, "exam_clinico": 100, "gpc_summary": 50},
+    "premium": {"lesson": 1000, "exam": 500, "exam_clinico": 300, "gpc_summary": 300},
 }
 
 
@@ -410,7 +410,7 @@ PREMIUM_GPC_SUMMARY_MONTHLY_CAP = int(os.getenv("PREMIUM_GPC_SUMMARY_MONTHLY_CAP
 Plan = Literal["free", "pro", "premium"]
 Level = Literal["auto", "pregrado", "internado"]
 StudyMode = Literal["basico", "clinico", "internado", "examen"]
-Module = Literal["lesson", "exam", "enarm", "gpc_summary"]
+Module = Literal["lesson", "exam", "exam_clinico", "gpc_summary"]
 
 
 def _now_iso() -> str:
@@ -1206,7 +1206,7 @@ def can_use_web_search(plan: Plan) -> bool:
     return plan in ("pro", "premium")
 
 
-def can_use_enarm(plan: Plan) -> bool:
+def can_use_exam_clinico(plan: Plan) -> bool:
     return plan in ("pro", "premium")
 
 
@@ -1230,7 +1230,7 @@ def compute_capabilities(plan: str) -> dict:
         "modules": {
             "lesson": True,
             "exam": True,
-            "enarm": can_use_enarm(plan),            # Pro/Premium
+            "exam_clinico": can_use_exam_clinico(plan),            # Pro/Premium
             "gpc_summary": can_use_gpc_summary(plan) # Pro/Premium
         },
         "features": {
@@ -1238,7 +1238,7 @@ def compute_capabilities(plan: str) -> dict:
         },
         "quotas": {
             "gpc_summary_per_month": gpc_summary_monthly_cap(plan),
-            "enarm_cases_per_month": 0 if plan == "free" else (40 if plan == "pro" else 120),
+            "exam_clinico_cases_per_month": 0 if plan == "free" else (40 if plan == "pro" else 120),
         },
     }
 
@@ -1819,7 +1819,7 @@ NPM_PROFILE = {
         "Incluir diagnóstico diferencial, estándar de oro y tamizaje cuando aplique.",
         "Tratamiento acorde al nivel (pregrado/internado), sin dosis exactas salvo solicitud expresa.",
         "Incluir pronóstico, complicaciones y algoritmos diagnósticos/terapéuticos con pasos numerados.",
-        "Agregar perlas tipo ENARM/USMLE y errores clínicos frecuentes.",
+        "Agregar perlas high-yield (tipo examen de certificación) y errores clínicos frecuentes.",
     ],
 }
 
@@ -1932,7 +1932,7 @@ A) HIGH-YIELD (no cruza líneas; máximo 5–8 por documento):
 
 B) BADGES (solo en headings H2; máximo 2 por sección; SIEMPRE al inicio):
 ## [badge:alta_prioridad] Diagnóstico
-Badges soportados: alta_prioridad, concepto_clave, red_flag, error_frecuente, enfoque_enarm
+Badges soportados: alta_prioridad, concepto_clave, red_flag, error_frecuente, enfoque_exam_clinico
 
 C) CALLOUTS (blockquote explícito; primera línea EXACTA):
 > [callout:perla_clinica]
@@ -2051,7 +2051,7 @@ Genera un RESUMEN basado en Guías de Práctica Clínica (GPC) mexicanas vigente
 El contenido debe ser ORIGINAL, EDUCATIVO y NO copiar texto literal de ninguna guía.
 
 Materia: {subject_name}
-Tema ENARM: {topic_name}
+Tema high-yield: {topic_name}
 
 REGLA CRÍTICA:
 - DEBES usar web_search para identificar una GPC mexicana pertinente y vigente.
@@ -2060,7 +2060,7 @@ REGLA CRÍTICA:
 
 Estructura OBLIGATORIA (Markdown), en este orden:
 
-## Puntos clave ENARM
+## Puntos clave high-yield
 ## Diagnóstico y criterios
 ## Conducta / primera línea (principios)
 ## Red flags / criterios de referencia
@@ -2162,7 +2162,7 @@ NPM_SUBJECT_RULES = {
         "Tratamiento farmacológico: permitir fármacos de elección y alternativas con su mecanismo de acción; NO incluir dosis exactas ni esquemas detallados salvo solicitud expresa.",
         "Diferenciar claramente colonización vs infección y portador vs enfermedad activa cuando aplique.",
         "Prevención es obligatoria: vacunas, profilaxis y medidas de control.",
-        "Integrar perlas ENARM/USMLE y preguntas tipo examen con razonamiento clínico.",
+        "Integrar perlas high-yield (tipo certificación) y preguntas tipo examen con razonamiento clínico.",
         "Evitar farmacología profunda (farmacocinética, ajustes finos); mantener enfoque microbiológico-clínico.",
     ],
     "farmacologia": [
@@ -2222,7 +2222,7 @@ NPM_SUBJECT_RULES = {
         "Incluir medidas preventivas cuando el tema lo requiera (vacunas, control de contagio, medidas de contacto, profilaxis si aplica).",
         "Complicaciones deben ser concretas y clínicas (p. ej., sepsis, cicatriz, postinflamatoria, nefritis postestreptocócica, compromiso ocular, etc.).",
         "Pronóstico debe incluir: curso esperado, recurrencia, y factores de mal pronóstico.",
-        "Agregar perlas high-yield ENARM/USMLE solo si son realmente discriminativas del diagnóstico o manejo (no relleno).",
+        "Agregar perlas high-yield (tipo certificación) solo si son realmente discriminativas del diagnóstico o manejo (no relleno).",
         "Preguntas de repaso: 8–12 con enfoque en reconocimiento de lesiones, diferenciales clave y decisión terapéutica.",
         "Errores clínicos frecuentes: 5–8 orientados a fallas reales (confundir celulitis vs dermatitis, omitir mucosas en SJS/TEN, etc.).",
         "No dar recomendaciones para auto-tratamiento del público general; el enfoque es médico-académico.",
@@ -2562,7 +2562,7 @@ MODO: CLÍNICO (E-Vantis).
 Objetivo: decidir y actuar.
 - Prioriza presentación clínica, signos/síntomas clave, diagnóstico diferencial, red flags.
 - Enfatiza enfoque diagnóstico y conducta inicial/algoritmos.
-- Incluye errores clínicos frecuentes y perlas tipo ENARM/USMLE.
+- Incluye errores clínicos frecuentes y perlas high-yield (tipo certificación).
 """.strip(),
 }
 
@@ -2706,7 +2706,7 @@ class TeachCurriculumIn(BaseModel):
     study_mode: StudyMode = "clinico"
     module: Module = "lesson"
 
-    enarm_context: StrictBool = False
+    exam_clinico_context: StrictBool = False
     use_guides: StrictBool = False
 
     num_questions: int = 8
@@ -2791,7 +2791,7 @@ def usage_monthly_get_all(conn, user_id: str, yyyymm: str) -> dict:
 def build_usage_snapshot(plan: str, used_by_module: dict) -> dict:
     plan = (plan or "free").lower()
     snapshot = {}
-    for module in ("lesson", "exam", "enarm", "gpc_summary"):
+    for module in ("lesson", "exam", "exam_clinico", "gpc_summary"):
         limit = _quota_limit(plan, module)
         used = int(used_by_module.get(module, 0))
         remaining = max(0, int(limit) - used)
@@ -2815,7 +2815,7 @@ def _exam_spec_for_study_mode(study_mode: StudyMode) -> str:
     if study_mode == "internado":
         return "Examen prioriza conducta/urgencias: triage, ABC, decisiones iniciales, red flags."
     if study_mode == "examen":
-        return "Examen discriminativo estilo ENARM: preguntas retadoras, trampas comunes, elección de la mejor respuesta."
+        return "Examen discriminativo estilo certificación: preguntas retadoras, trampas comunes, elección de la mejor respuesta."
     return "Examen de medicina (general)."
 
 
@@ -3387,7 +3387,7 @@ def teach_curriculum(
             level = "internado"
 
         module = (as_str(payload.module) or "lesson").strip().lower()
-        if module not in ("lesson", "exam", "enarm", "gpc_summary"):
+        if module not in ("lesson", "exam", "exam_clinico", "gpc_summary"):
             raise HTTPException(status_code=422, detail=f"Módulo no soportado: {module}")
 
         study_mode = (as_str(payload.study_mode) or "clinico").strip().lower()
@@ -3408,8 +3408,8 @@ def teach_curriculum(
         # ----------------------------
         # Plan gating
         # ----------------------------
-        if module == "enarm" and not can_use_enarm(plan):
-            raise HTTPException(status_code=403, detail="ENARM solo disponible en Pro/Premium.")
+        if module == "exam_clinico" and not can_use_exam_clinico(plan):
+            raise HTTPException(status_code=403, detail="Caso clínico avanzado solo disponible en Pro/Premium.")
         if module == "gpc_summary" and not can_use_gpc_summary(plan):
             raise HTTPException(status_code=403, detail="Resumen GPC solo disponible en Pro/Premium.")
         if use_guides and not can_use_web_search(plan):
@@ -3625,27 +3625,28 @@ No omitir este bloque.
             user_msg = build_exam_prompt(subject_name, topic_name, level, study_mode, n_questions=15)
 
         # ======================================================================
-        # MODULE: ENARM
+        # MODULE: EXAM_CLINICO
         # ======================================================================
-        elif module == "enarm":
+        elif module == "exam_clinico":
             if npm_profile == "basicas":
-                raise HTTPException(status_code=422, detail="ENARM no disponible en materias básicas.")
-            if not payload.enarm_context:
-                raise HTTPException(status_code=422, detail="Para ENARM activa enarm_context=true.")
+                raise HTTPException(status_code=422, detail="Caso clínico avanzado no disponible en materias básicas.")
+            if not payload.exam_clinico_context:
+                raise HTTPException(status_code=422, detail="Para Caso clínico avanzado activa exam_clinico_context=true.")
 
             n = int(getattr(payload, "num_questions", 8) or 8)
             if n < 4 or n > 20:
                 raise HTTPException(status_code=422, detail="num_questions debe estar entre 4 y 20.")
 
             user_msg = f"""
-Genera un CASO CLÍNICO SERIADO estilo ENARM sobre:
+
+Genera un CASO CLÍNICO SERIADO estilo examen clínico de certificación sobre:
 Materia: {subject_name}
 Tema: {topic_name}
 Nivel: {level}
 
 Requisitos:
 - Caso clínico completo.
-- 1 caso con {n} preguntas seriadas tipo ENARM.
+- 1 caso con {n} preguntas seriadas tipo examen clínico.
 - Enfoque discriminativo diagnóstico/interpretación/conducta.
 - NO incluyas dosis exactas salvo que el usuario lo pida.
 """.strip()
@@ -3656,7 +3657,7 @@ Requisitos:
 
             system_msg = """
 Eres E-VANTIS.
-Especialista en preparación ENARM.
+Especialista en razonamiento clínico y evaluación por casos.
 """.strip()
 
         # ======================================================================
@@ -3827,8 +3828,8 @@ NO modifiques el resto del documento; solo añade el bloque final.
             resp_out["lesson"] = content_text
         elif module == "exam":
             resp_out["exam"] = content_text
-        elif module == "enarm":
-            resp_out["enarm"] = content_text
+        elif module == "exam_clinico":
+            resp_out["exam_clinico"] = content_text
         elif module == "gpc_summary":
             resp_out["gpc_summary"] = content_text
         else:

@@ -4,7 +4,7 @@ Estos scripts validan el comportamiento del backend en producción o staging.
 
 Cobertura:
 - autenticación, single-session, revoke, logout
-- lesson, exam, enarm (gating por plan)
+- lesson, exam, exam_clinico (gating por plan)
 - gpc_summary (deploy-safe)
 - cuotas mensuales, rate limit
 - api key inválida, subject inexistente, idempotency

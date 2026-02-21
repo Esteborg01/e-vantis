@@ -47,23 +47,23 @@ post_teach "exam" ""
 echo "OK exam"
 
 if [ "$PLAN" = "pro" ] || [ "$PLAN" = "premium" ]; then
-  echo "7) enarm (200 esperado en pro/premium)"
-  post_teach "enarm" ",\"enarm_context\":true,\"num_questions\":5"
-  echo "OK enarm"
+  echo "7) exam_clinico (200 esperado en pro/premium)"
+  post_teach "exam_clinico" ",\"exam_clinico_context\":true,\"num_questions\":5"
+  echo "OK exam_clinico"
 
   echo "8) gpc_summary (200 esperado en pro/premium)"
   post_teach "gpc_summary" ",\"use_guides\":false"
   echo "OK gpc_summary"
 else
-  echo "7) enarm (403 esperado en free)"
+  echo "7) exam_clinico (403 esperado en free)"
   set +e
   RES=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/teach/curriculum" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: $API_KEY" \
     -H "Authorization: Bearer $TOKEN" \
-    -d "{\"subject_id\":\"urgencias\",\"topic_id\":\"$TOPIC_ID\",\"module\":\"enarm\",\"enarm_context\":true,\"num_questions\":5}")
+    -d "{\"subject_id\":\"urgencias\",\"topic_id\":\"$TOPIC_ID\",\"module\":\"exam_clinico\",\"exam_clinico_context\":true,\"num_questions\":5}")
   set -e
-  [ "$RES" = "403" ] && echo "OK enarm 403" || (echo "FAIL enarm expected 403 got $RES" && exit 1)
+  [ "$RES" = "403" ] && echo "OK exam_clinico 403" || (echo "FAIL exam_clinico expected 403 got $RES" && exit 1)
 
   echo "8) gpc_summary (403 esperado en free)"
   set +e

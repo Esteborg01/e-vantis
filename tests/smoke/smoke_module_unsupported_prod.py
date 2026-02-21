@@ -81,7 +81,7 @@ if status == "422":
     # Caso B: Pydantic devuelve lista de errores
     if isinstance(detail, list):
         s = json.dumps(detail, ensure_ascii=False).lower()
-        if ("input should be" in s) and ("lesson" in s) and ("exam" in s) and ("enarm" in s) and ("gpc_summary" in s):
+        if ("input should be" in s) and ("lesson" in s) and ("exam" in s) and ("exam_clinico" in s) and ("gpc_summary" in s):
             print("SMOKE_OK: unsupported module rejected (422) — pydantic literal validation")
             sys.exit(0)
 

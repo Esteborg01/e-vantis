@@ -42,15 +42,15 @@ tok = j.get("access_token")
 if not tok:
     print("LOGIN_MISSING_TOKEN"); print(j); sys.exit(1)
 
-# --- ENARM (debe estar GATED en plan Free) ---
+# --- EXAM_CLINICO (debe estar GATED en plan Free) ---
 payload = {
     "subject_id": "hematologia",
     "topic_id": "hema_t1_medula_osea_hematopoyesis",
-    "module": "enarm",
+    "module": "exam_clinico",
     "duration_minutes": 20,
     "level": "auto",
     "style": "magistral",
-    "enarm_context": True
+    "exam_clinico_context": True
 }
 
 cmd = (
@@ -63,28 +63,28 @@ cmd = (
 
 rc, out, err = run(cmd)
 if rc != 0:
-    print("ENARM_CURL_FAIL"); print(err or out); sys.exit(1)
+    print("EXAM_CLINICO_CURL_FAIL"); print(err or out); sys.exit(1)
 
 body, status = split(out)
-print("ENARM_STATUS:", status)
-print("ENARM_BODY_HEAD:", body[:300].replace("\n", "\\n"))
+print("EXAM_CLINICO_STATUS:", status)
+print("EXAM_CLINICO_BODY_HEAD:", body[:300].replace("\n", "\\n"))
 
 # PASS esperado: 403 por gating
 if status == "403":
     try:
         jj = json.loads(body)
     except Exception:
-        print("ENARM_403_NON_JSON"); print(body); sys.exit(1)
+        print("EXAM_CLINICO_403_NON_JSON"); print(body); sys.exit(1)
 
     detail = (jj.get("detail") or "").lower() if isinstance(jj, dict) else ""
-    if ("enarm" in detail) and (("pro" in detail) or ("premium" in detail)):
-        print("SMOKE_OK: ENARM gated correctly for Free plan")
+    if ("exam_clinico" in detail) and (("pro" in detail) or ("premium" in detail)):
+        print("SMOKE_OK: EXAM_CLINICO gated correctly for Free plan")
         sys.exit(0)
 
     print("SMOKE_FAIL: 403 but unexpected detail")
     print(body)
     sys.exit(1)
 
-print("SMOKE_FAIL: ENARM gating incorrect (expected 403)")
+print("SMOKE_FAIL: EXAM_CLINICO gating incorrect (expected 403)")
 print(body)
 sys.exit(1)

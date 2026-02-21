@@ -34,15 +34,15 @@ tok = json.loads(body).get("access_token")
 if not tok:
     print("LOGIN_MISSING_TOKEN"); sys.exit(1)
 
-# ENARM (debe permitir en PRO)
+# EXAM_CLINICO (debe permitir en PRO)
 payload = {
   "subject_id":"hematologia",
   "topic_id":"hema_t1_medula_osea_hematopoyesis",
-  "module":"enarm",
+  "module":"exam_clinico",
   "duration_minutes":20,
   "level":"auto",
   "style":"magistral",
-  "enarm_context": True,
+  "exam_clinico_context": True,
   "num_questions": 8
 }
 
@@ -54,19 +54,19 @@ rc,out,err = run(
     f"-d '{json.dumps(payload)}'"
 )
 if rc!=0:
-    print("ENARM_CURL_FAIL"); print(err or out); sys.exit(1)
+    print("EXAM_CLINICO_CURL_FAIL"); print(err or out); sys.exit(1)
 
 body,status = split(out)
-print("ENARM_STATUS:", status)
-print("ENARM_BODY_HEAD:", body[:300].replace("\n","\\n"))
+print("EXAM_CLINICO_STATUS:", status)
+print("EXAM_CLINICO_BODY_HEAD:", body[:300].replace("\n","\\n"))
 
 if status=="200":
     j=json.loads(body)
-    assert j.get("module")=="enarm", "module != enarm"
-    assert "enarm" in j and isinstance(j["enarm"], str) and len(j["enarm"])>200, "enarm missing/short"
-    print("SMOKE_OK: ENARM allowed + contract valid (PRO)")
+    assert j.get("module")=="exam_clinico", "module != exam_clinico"
+    assert "exam_clinico" in j and isinstance(j["exam_clinico"], str) and len(j["exam_clinico"])>200, "exam_clinico missing/short"
+    print("SMOKE_OK: EXAM_CLINICO allowed + contract valid (PRO)")
     sys.exit(0)
 
-print("SMOKE_FAIL: expected 200 for PRO ENARM")
+print("SMOKE_FAIL: expected 200 for PRO EXAM_CLINICO")
 print(body)
 sys.exit(1)
