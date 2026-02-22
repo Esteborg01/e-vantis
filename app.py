@@ -851,7 +851,7 @@ def db_init():
         except Exception:
             pass
 
-                # ----------------------------
+        # ----------------------------
         # Stripe columns (MVP)
         # ----------------------------
         try:
@@ -868,6 +868,26 @@ def db_init():
             pass
         try:
             conn.execute("ALTER TABLE users ADD COLUMN stripe_current_period_end INTEGER")
+        except Exception:
+            pass
+
+        # ----------------------------
+        # Stripe cancellation fields (Portal)
+        # ----------------------------
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_cancel_at_period_end INTEGER")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_cancel_at INTEGER")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_canceled_at INTEGER")
+        except Exception:
+            pass
+        try:
+            conn.execute("UPDATE users SET stripe_cancel_at_period_end=0 WHERE stripe_cancel_at_period_end IS NULL")
         except Exception:
             pass
 
@@ -1043,6 +1063,9 @@ def db_update_stripe_fields(
     subscription_id: Optional[str] = None,
     status: Optional[str] = None,
     current_period_end: Optional[int] = None,
+    cancel_at_period_end: Optional[bool] = None,
+    cancel_at: Optional[int] = None,
+    canceled_at: Optional[int] = None,
 ) -> None:
     with db_conn() as conn:
         conn.execute(
@@ -1052,10 +1075,22 @@ def db_update_stripe_fields(
               stripe_customer_id = COALESCE(?, stripe_customer_id),
               stripe_subscription_id = COALESCE(?, stripe_subscription_id),
               stripe_status = COALESCE(?, stripe_status),
-              stripe_current_period_end = COALESCE(?, stripe_current_period_end)
+              stripe_current_period_end = COALESCE(?, stripe_current_period_end),
+              stripe_cancel_at_period_end = COALESCE(?, stripe_cancel_at_period_end),
+              stripe_cancel_at = COALESCE(?, stripe_cancel_at),
+              stripe_canceled_at = COALESCE(?, stripe_canceled_at)
             WHERE user_id = ?
             """,
-            (customer_id, subscription_id, status, current_period_end, user_id),
+            (
+                customer_id,
+                subscription_id,
+                status,
+                current_period_end,
+                None if cancel_at_period_end is None else (1 if cancel_at_period_end else 0),
+                cancel_at,
+                canceled_at,
+                user_id,
+            ),
         )
         conn.commit()
 
@@ -1426,11 +1461,15 @@ def require_admin(x_api_key: str = Depends(require_student_or_admin)) -> str:
         "customer.subscription.created",
         "customer.subscription.updated",
         "customer.subscription.deleted",
+        
     ):
         customer_id = (obj.get("customer") or "").strip()
         sub_id = (obj.get("id") or "").strip()
         status = (obj.get("status") or "").strip()
         current_period_end = int(obj.get("current_period_end") or 0)
+        cancel_at_period_end = bool(obj.get("cancel_at_period_end") or False)
+        cancel_at = int(obj.get("cancel_at") or 0) or None
+        canceled_at = int(obj.get("canceled_at") or 0) or None
 
         # price id (primera línea del subscription item)
         price_id = ""
@@ -1468,6 +1507,9 @@ def require_admin(x_api_key: str = Depends(require_student_or_admin)) -> str:
             subscription_id=sub_id,
             status=status,
             current_period_end=current_period_end if current_period_end else None,
+            cancel_at_period_end=cancel_at_period_end,
+            cancel_at=cancel_at,
+            canceled_at=canceled_at,
         )
 
         # Downgrade NO agresivo: solo terminales
