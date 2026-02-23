@@ -36,6 +36,10 @@ from routes_curriculum import router as curriculum_router
 
 from services.email_provider import send_verify_email, send_reset_password_email
 
+import traceback
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
+
 # =========================
 # LOAD .env EARLY (MUST BE BEFORE os.getenv)
 # =========================
@@ -226,7 +230,66 @@ def enforce_idempotency(conn, user_id: str, idem_key: str, ttl_seconds: int = 30
                 continue
             raise
 
+def _safe_str(x, maxlen=400):
+    try:
+        s = str(x)
+        return s if len(s) <= maxlen else s[:maxlen] + "…"
+    except Exception:
+        return ""
+
+def log_json(obj: dict):
+    # Render logs friendly: 1 JSON por línea
+    print(json.dumps(obj, ensure_ascii=False))
+
+class RequestLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        start = time.time()
+
+        ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "")
+        ua = request.headers.get("user-agent", "")
+        method = request.method
+        path = request.url.path
+
+        # ✅ útil si luego quieres correlación en handlers
+        request.state.request_id = rid
+
+        try:
+            resp: StarletteResponse = await call_next(request)
+            ms = int((time.time() - start) * 1000)
+
+            log_json({
+                "type": "http",
+                "rid": rid,
+                "method": method,
+                "path": path,
+                "status": getattr(resp, "status_code", None),
+                "ms": ms,
+                "ip": ip,
+                "ua": _safe_str(ua, 180),
+            })
+
+            # ✅ que el frontend/cliente pueda correlacionar
+            resp.headers["X-Request-Id"] = rid
+            return resp
+
+        except Exception as e:
+            ms = int((time.time() - start) * 1000)
+            log_json({
+                "type": "error",
+                "rid": rid,
+                "method": method,
+                "path": path,
+                "ms": ms,
+                "ip": ip,
+                "ua": _safe_str(ua, 180),
+                "err": _safe_str(repr(e), 800),
+                "trace": _safe_str(traceback.format_exc(), 4000),
+            })
+            raise
+
 app = FastAPI(title="E-VANTIS")
+app.add_middleware(RequestLogMiddleware)
 
 # =========================
 # CORS (DEBE IR AQUÍ ARRIBA)
