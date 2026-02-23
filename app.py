@@ -1639,6 +1639,148 @@ def _user_email_or_400(user: dict) -> str:
 class CheckoutRequest(BaseModel):
     plan: Literal["pro", "premium"]
 
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    # 1) leer payload raw + firma
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    if not STRIPE_WEBHOOK_SECRET:
+        # si no hay secret, NO puedes validar firma
+        raise HTTPException(status_code=500, detail="Falta STRIPE_WEBHOOK_SECRET (webhook no puede validarse).")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        # firma inválida / secret incorrecto / modo equivocado
+        print("[STRIPE_WEBHOOK] signature_error:", repr(e))
+        raise HTTPException(status_code=400, detail="Webhook signature inválida.")
+
+    event_id = (event.get("id") or "").strip()
+    event_type = (event.get("type") or "").strip()
+
+    # 2) idempotencia
+    if event_id:
+        is_new = db_register_stripe_event(event_id)
+        if not is_new:
+            return {"ok": True, "dedup": True}
+
+    obj = event["data"]["object"]
+
+    # =========================================================
+    # A) UPGRADE INMEDIATO: checkout.session.completed
+    # =========================================================
+    if event_type == "checkout.session.completed":
+        metadata = obj.get("metadata") or {}
+        user_id = (metadata.get("user_id") or "").strip()
+        plan = (metadata.get("plan") or "").strip().lower()
+
+        customer_id = (obj.get("customer") or "").strip() or None
+        subscription_id = (obj.get("subscription") or "").strip() or None
+        status = (obj.get("status") or "").strip() or None
+
+        if user_id and plan in ("pro", "premium"):
+            # ✅ persistir customer/subscription/status
+            db_update_stripe_fields(
+                user_id=user_id,
+                customer_id=customer_id,
+                subscription_id=subscription_id,
+                status=status,
+            )
+            # ✅ set plan YA
+            db_set_plan(user_id, plan)
+
+            print(f"[STRIPE_WEBHOOK] checkout.completed -> user={user_id} plan={plan} customer={customer_id} sub={subscription_id}")
+            return {"ok": True, "event": event_type, "user_id": user_id, "plan": plan}
+
+        print(f"[STRIPE_WEBHOOK] checkout.completed missing metadata user_id/plan event_id={event_id}")
+        return {"ok": True, "event": event_type, "warning": "missing_metadata"}
+
+    # =========================================================
+    # B) Subscription lifecycle (refuerzo / downgrades)
+    # =========================================================
+    if event_type in (
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    ):
+        customer_id = (obj.get("customer") or "").strip()
+        sub_id = (obj.get("id") or "").strip()
+        status = (obj.get("status") or "").strip()
+        current_period_end = int(obj.get("current_period_end") or 0) or None
+        cancel_at_period_end = bool(obj.get("cancel_at_period_end") or False)
+        cancel_at = int(obj.get("cancel_at") or 0) or None
+        canceled_at = int(obj.get("canceled_at") or 0) or None
+
+        # price_id (primera línea del subscription item)
+        price_id = ""
+        try:
+            items = (obj.get("items") or {}).get("data") or []
+            if items:
+                price = (items[0].get("price") or {})
+                price_id = (price.get("id") or "").strip()
+        except Exception:
+            price_id = ""
+
+        # Resolver usuario por customer_id
+        user = db_get_user_by_stripe_customer(customer_id) if customer_id else None
+
+        # fallback: si no está linkeado, intenta por metadata del customer
+        if not user and customer_id:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                meta = (cust.get("metadata") or {})
+                uid = (meta.get("evantis_user_id") or "").strip()
+                if uid:
+                    db_update_stripe_fields(user_id=uid, customer_id=customer_id)
+                    user = db_get_user_by_id(uid)
+            except Exception as e:
+                print("[STRIPE_WEBHOOK] customer_retrieve_failed:", repr(e))
+
+        if not user:
+            print(f"[STRIPE_WEBHOOK] unlinked_customer event={event_type} customer={customer_id}")
+            return {"ok": True, "unlinked_customer": True}
+
+        # Persistir estado Stripe
+        db_update_stripe_fields(
+            user_id=user["user_id"],
+            customer_id=customer_id,
+            subscription_id=sub_id,
+            status=status,
+            current_period_end=current_period_end,
+            cancel_at_period_end=cancel_at_period_end,
+            cancel_at=cancel_at,
+            canceled_at=canceled_at,
+        )
+
+        # Downgrade solo terminales
+        terminal = status in ("canceled", "incomplete_expired")
+        if event_type == "customer.subscription.deleted" or terminal:
+            db_set_plan(user["user_id"], "free")
+            return {"ok": True, "plan": "free", "status": status}
+
+        # Activo o trial -> plan por price_id
+        if status in ("active", "trialing"):
+            plan = plan_from_price_id(price_id)
+            if plan in ("pro", "premium"):
+                db_set_plan(user["user_id"], plan)
+                return {"ok": True, "plan": plan, "status": status}
+
+        # Estados intermedios: no degradar
+        return {"ok": True, "status": status, "plan_unchanged": True}
+
+    # =========================================================
+    # C) Invoices (no cambian plan)
+    # =========================================================
+    if event_type in ("invoice.paid", "invoice.payment_failed"):
+        return {"ok": True, "event": event_type}
+
+    return {"ok": True, "event": event_type}
+
 @app.post("/billing/checkout")
 def billing_checkout(payload: CheckoutRequest, user: dict = Depends(require_user)):
     if not STRIPE_SECRET_KEY:
