@@ -47,8 +47,8 @@ load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 # ----------------------------
 QUOTAS = {
     "free": {"lesson": 10, "exam": 5, "exam_clinico": 0, "gpc_summary": 0},
-    "pro": {"lesson": 250, "exam": 150, "exam_clinico": 100, "gpc_summary": 50},
-    "premium": {"lesson": 1000, "exam": 500, "exam_clinico": 300, "gpc_summary": 300},
+    "pro": {"lesson": 250, "exam": 150, "exam_clinico": 100, "gpc_summary": 30},
+    "premium": {"lesson": 1000, "exam": 500, "exam_clinico": 300, "gpc_summary": 100},
 }
 
 
