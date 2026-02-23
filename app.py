@@ -1333,12 +1333,27 @@ def has_review_questions(md: str) -> bool:
     return ("preguntas" in tail and "repaso" in tail)
 
 class AcceptTermsIn(BaseModel):
-    terms_version: str = "v1"
+    terms_version: str = Field(..., min_length=1, max_length=64)
 
 @app.post("/auth/accept-terms")
 def accept_terms(body: AcceptTermsIn, user: dict = Depends(require_user)):
-    db_accept_terms(user["user_id"], body.terms_version)
-    return {"ok": True, "accepted_terms": True, "terms_version": body.terms_version, "accepted_terms_at": _now_iso()}
+    tv = (body.terms_version or "").strip()
+    if not tv:
+        raise HTTPException(status_code=400, detail="terms_version requerido.")
+
+    db_accept_terms(user["user_id"], tv)
+
+    # ✅ Devuelve la verdad desde DB (evita timestamps inconsistentes)
+    u2 = db_get_user_by_id(user["user_id"])
+    if not u2:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    return {
+        "ok": True,
+        "accepted_terms": bool(int(u2.get("accepted_terms") or 0)),
+        "accepted_terms_at": u2.get("accepted_terms_at"),
+        "terms_version": u2.get("terms_version"),
+    }
 
 @app.get("/auth/me")
 def auth_me(user: dict = Depends(require_user)):
@@ -3514,6 +3529,11 @@ def usage_me(user: dict = Depends(require_user)):
 # ----------------------------
 @app.post("/teach", response_model=TeachResponse, dependencies=[Depends(rate_limit_teach)])
 def teach(req: TeachRequest, response: Response, claims: dict = Depends(require_user)):
+    if not claims.get("accepted_terms"):
+        raise HTTPException(
+            status_code=403,
+            detail="Debes aceptar Términos y Condiciones para continuar."
+        )
     level = req.level if req.level != "auto" else detect_level_simple(req.topic)
     mode = "clinico"
     model = MODEL_BY_MODE.get(mode, os.getenv("EVANTIS_OPENAI_MODEL", "gpt-4.1-mini"))
@@ -3587,6 +3607,11 @@ def teach_curriculum(
     user: dict = Depends(require_user),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    if not user.get("accepted_terms"):
+        raise HTTPException(
+            status_code=403,
+            detail="Debes aceptar Términos y Condiciones para continuar."
+        )
     conn = db_conn()
     ip = request.client.host if request.client else "unknown"
     enforce_rate_limit(conn, user["user_id"], ip, "/teach/curriculum", limit_per_minute=30)
