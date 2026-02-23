@@ -631,7 +631,10 @@ def db_get_user_by_id(user_id: str) -> dict | None:
                 email_verified,
                 stripe_customer_id,
                 stripe_subscription_id,
-                stripe_status
+                stripe_status,
+                accepted_terms,
+                accepted_terms_at,
+                terms_version
             FROM users
             WHERE user_id = ?
             """,
@@ -700,6 +703,24 @@ def db_revoke_all_sessions_for_user(user_id: str) -> int:
         )
         conn.commit()
         return int(cur.rowcount or 0)
+
+def db_accept_terms(user_id: str, terms_version: str) -> None:
+    tv = (terms_version or "").strip()
+    if not tv:
+        tv = "v1"  # fallback seguro
+
+    with db_conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET accepted_terms=1,
+                accepted_terms_at=?,
+                terms_version=?
+            WHERE user_id=?
+            """,
+            (_now_iso(), tv, user_id),
+        )
+        conn.commit()
 
 def db_conn():
     conn = sqlite3.connect(
@@ -888,6 +909,28 @@ def db_init():
             pass
         try:
             conn.execute("UPDATE users SET stripe_cancel_at_period_end=0 WHERE stripe_cancel_at_period_end IS NULL")
+        except Exception:
+            pass
+
+        # ----------------------------
+        # Terms & Conditions acceptance (MVP)
+        # ----------------------------
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN accepted_terms INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN accepted_terms_at TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN terms_version TEXT")
+        except Exception:
+            pass
+
+        # Backfill defensivo
+        try:
+            conn.execute("UPDATE users SET accepted_terms=0 WHERE accepted_terms IS NULL")
         except Exception:
             pass
 
@@ -1228,6 +1271,9 @@ def require_user(token: str = Depends(oauth2_scheme)) -> dict:
         "stripe_subscription_id": (u.get("stripe_subscription_id") or None),
         "stripe_status": (u.get("stripe_status") or None),
         "is_active": bool(int(u.get("is_active") or 0)),
+        "accepted_terms": bool(int(u.get("accepted_terms") or 0)),
+        "accepted_terms_at": u.get("accepted_terms_at"),
+        "terms_version": u.get("terms_version"),
     }
 
 def require_plan(min_plan: Plan, user: dict = Depends(require_user)) -> dict:
@@ -1286,6 +1332,13 @@ def has_review_questions(md: str) -> bool:
         return True
     return ("preguntas" in tail and "repaso" in tail)
 
+class AcceptTermsIn(BaseModel):
+    terms_version: str = "v1"
+
+@app.post("/auth/accept-terms")
+def accept_terms(body: AcceptTermsIn, user: dict = Depends(require_user)):
+    db_accept_terms(user["user_id"], body.terms_version)
+    return {"ok": True, "accepted_terms": True, "terms_version": body.terms_version, "accepted_terms_at": _now_iso()}
 
 @app.get("/auth/me")
 def auth_me(user: dict = Depends(require_user)):
@@ -1294,6 +1347,9 @@ def auth_me(user: dict = Depends(require_user)):
         "user_id": user["user_id"],
         "plan": plan,
         "capabilities": compute_capabilities(plan),
+        "accepted_terms": bool(int(user.get("accepted_terms") or 0)),
+        "accepted_terms_at": user.get("accepted_terms_at"),
+        "terms_version": user.get("terms_version"),
     }
 
 
@@ -1750,6 +1806,11 @@ async def stripe_webhook(request: Request):
 
 @app.post("/billing/checkout")
 def billing_checkout(payload: CheckoutRequest, user: dict = Depends(require_user)):
+    if not user.get("accepted_terms"):
+        raise HTTPException(
+            status_code=403,
+            detail="Debes aceptar Términos y Condiciones para continuar."
+        )
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe no configurado (STRIPE_SECRET_KEY)")
 
@@ -3027,6 +3088,11 @@ def ready():
 # ----------------------------
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(rate_limit_chat)])
 def chat(req: ChatRequest, user: dict = Depends(require_user)):
+    if not user.get("accepted_terms"):
+        raise HTTPException(
+            status_code=403,
+            detail="Debes aceptar Términos y Condiciones para continuar."
+        )
     if req.mode not in MODE_PROMPTS:
         raise HTTPException(status_code=422, detail="Modo inválido: Solo: academico, clinico.")
 
