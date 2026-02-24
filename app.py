@@ -356,12 +356,17 @@ async def add_request_id(request: Request, call_next):
 # CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
 FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL", "") or "").strip().rstrip("/")
+
+# ✅ Una sola lista "source of truth" (incluye PROD + DEV)
 default_origins = [
+    "https://app.e-vantis.com",
+    "https://e-vantis.com",
     "https://evantis-frontend.onrender.com",
-    "https://evantis-frontend.onrenderer.com",
+    "https://evantis-frontend.onrenderer.com",  # si realmente lo usas
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
+
 if FRONTEND_BASE_URL:
     default_origins.append(FRONTEND_BASE_URL)
 
@@ -393,7 +398,6 @@ def _parse_cors_origins(raw: str) -> list[str]:
             norm.append(o2)
     return norm
 
-
 env_origins = (os.getenv("EVANTIS_CORS_ORIGINS", "") or "").strip()
 parsed = _parse_cors_origins(env_origins)
 
@@ -402,24 +406,14 @@ allowed = sorted({o for o in allowed if o})
 
 print(">>> CORS allowed =", allowed)
 
-default_origins = [
-    "https://app.e-vantis.com",
-    "https://e-vantis.com",
-    "https://evantis-frontend.onrender.com",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,              # ✅ ESTA es la lista correcta
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Idempotency-Key"],
+    allow_origins=allowed,              # ✅ lista de orígenes permitidos
+    allow_credentials=False,            # ✅ no cookies cross-site
+    allow_methods=["*"],                # ✅ GET/POST/OPTIONS/...
+    allow_headers=["*"],                # ✅ FIX: permite preflight con headers extra
     expose_headers=["*"],
 )
-
-print(">>> CORS allowed =", allowed)
 
 print(">>> LOADED app.py FROM:", __file__)
 app.include_router(curriculum_router)
@@ -1000,6 +994,20 @@ def db_init():
         # Backfill defensivo para bases existentes
         try:
             conn.execute("UPDATE users SET email_verified=0 WHERE email_verified IS NULL")
+        except Exception:
+            pass
+
+        # ----------------------------
+        # users.created_at (defensivo)
+        # ----------------------------
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+        except Exception:
+            pass
+
+        # Backfill si quedó NULL
+        try:
+            conn.execute("UPDATE users SET created_at = COALESCE(created_at, ?) WHERE created_at IS NULL", (_now_iso(),))
         except Exception:
             pass
 
@@ -3747,8 +3755,8 @@ def admin_overview(admin=Depends(require_admin)):
             rows = cur.execute(
                 """
                 SELECT module, COUNT(*) AS n
-                FROM usage_logs
-                WHERE ts >= ?
+                FROM usage_log
+                WHERE created_at >= ?
                 GROUP BY module
                 """,
                 (month_start,),
@@ -3775,26 +3783,45 @@ def admin_users(limit: int = 50, admin=Depends(require_admin)):
     cur = conn.cursor()
 
     try:
-        # Si no existe created_at, cambia ORDER BY created_at -> ORDER BY rowid
-        rows = cur.execute(
-            """
-            SELECT id, email, plan, created_at
-            FROM users
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        # 1) Intento "moderno": created_at existe
+        try:
+            rows = cur.execute(
+                """
+                SELECT user_id, email, plan, created_at
+                FROM users
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
 
-        out = []
+        except sqlite3.OperationalError as e:
+            # 2) Fallback: DB vieja (sin created_at) -> usa rowid
+            if "no such column: created_at" in str(e).lower():
+                rows = cur.execute(
+                    """
+                    SELECT user_id, email, plan, NULL AS created_at
+                    FROM users
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            # 3) Si por algún motivo user_id tampoco existe (rarísimo), lo propagamos
+            else:
+                raise
+
+        items = []
         for r in rows:
-            out.append({
-                "id": r["id"],
+            items.append({
+                "user_id": r["user_id"],
                 "email": r["email"],
                 "plan": r["plan"],
                 "created_at": r["created_at"],
             })
-        return {"items": out}
+
+        return {"items": items}
+
     finally:
         conn.close()
 
