@@ -402,11 +402,12 @@ allowed = sorted({o for o in allowed if o})
 
 print(">>> CORS allowed =", allowed)
 
-ALLOWED_ORIGINS = [
+default_origins = [
     "https://app.e-vantis.com",
     "https://e-vantis.com",
-    "http://localhost:5173",   # dev
-    "http://localhost:3000",   # opcional dev
+    "https://evantis-frontend.onrender.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
 app.add_middleware(
