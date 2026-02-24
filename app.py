@@ -10,7 +10,7 @@ import hmac
 import secrets
 import stripe
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -292,6 +292,67 @@ app = FastAPI(title="E-VANTIS")
 app.add_middleware(RequestLogMiddleware)
 
 # =========================
+# PATCH 2 — RID + structured logs
+# =========================
+import logging
+
+logger = logging.getLogger("evantis")
+logging.basicConfig(level=os.getenv("EVANTIS_LOG_LEVEL", "INFO"))
+
+def _rid(request: Request) -> str:
+    try:
+        return getattr(request.state, "rid", None) or request.headers.get("x-request-id") or "no_rid"
+    except Exception:
+        return "no_rid"
+
+def _log(event: str, request: Request, **fields):
+    """
+    Log estructurado (JSON) para Render logs.
+    Nunca debe romper el request.
+    """
+    try:
+        payload = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "event": event,
+            "rid": _rid(request),
+            "method": getattr(request, "method", None),
+            "path": str(getattr(request, "url", "")).split("?")[0] if getattr(request, "url", None) else None,
+            **fields,
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        # fallback sin romper nada
+        print(f"[LOG_FAIL] event={event} fields={fields}")
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """
+    Asegura X-Request-ID estable:
+    - si viene header x-request-id: lo usamos
+    - si no: lo generamos
+    Además lo guarda en request.state.rid para usarlo en logs.
+    """
+    rid = request.headers.get("x-request-id") or request.headers.get("x-requestid")
+    if not rid:
+        rid = "rid_" + uuid.uuid4().hex[:16]
+    request.state.rid = rid
+
+    t0 = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        _log("unhandled_exception", request, error=repr(e))
+        raise
+    finally:
+        dt_ms = int((time.time() - t0) * 1000)
+        # log mínimo por request (opcional, lo puedes apagar)
+        if os.getenv("EVANTIS_LOG_HTTP", "0") == "1":
+            _log("http_request", request, ms=dt_ms)
+
+    response.headers["X-Request-ID"] = rid
+    return response
+
+# =========================
 # CORS (DEBE IR AQUÍ ARRIBA)
 # =========================
 FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL", "") or "").strip().rstrip("/")
@@ -551,16 +612,15 @@ def create_access_token(user_id: str, plan: Plan, sid: str, jti: str) -> str:
     import jwt
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-
 def decode_access_token(token: str) -> dict:
     import jwt
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.ExpiredSignatureError:
+        # mantenemos detail como string para no romper UI
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
-
 
 def require_auth(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
@@ -1303,30 +1363,63 @@ def db_touch_session_last_seen(user_id: str, jti: str):
 # ----------------------------
 # Auth: require_user / plan gating
 # ----------------------------
-def require_user(token: str = Depends(oauth2_scheme)) -> dict:
-    data = decode_access_token(token)
+def require_user(
+    request: Request,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    # 1) Decode token
+    try:
+        data = decode_access_token(token)
+    except HTTPException as e:
+        # 401 por token expirado/inválido
+        _log(
+            "auth_fail",
+            request,
+            reason="token_invalid_or_expired",
+            status=e.status_code,
+            detail=str(e.detail),
+        )
+        raise
+
     user_id = data.get("sub")
     jti = data.get("jti")
+    sid = data.get("sid")
 
+    # 2) Validaciones mínimas del payload
     if not user_id:
+        _log("auth_fail", request, reason="missing_sub", status=401, sid=sid, jti=jti)
         raise HTTPException(status_code=401, detail="Token inválido (sin sub).")
+
     if not jti:
+        _log("auth_fail", request, reason="missing_jti", status=401, user_id=user_id, sid=sid)
         raise HTTPException(status_code=401, detail="Sesión inválida o revocada.")
 
+    # 3) Cargar usuario
     u = db_get_user_by_id(user_id)
-    if not u or not u["is_active"]:
+    if not u:
+        _log("auth_fail", request, reason="user_not_found", status=401, user_id=user_id, sid=sid, jti=jti)
         raise HTTPException(status_code=401, detail="Usuario no activo.")
+    if not bool(int(u.get("is_active") or 0)):
+        _log("auth_fail", request, reason="user_inactive", status=401, user_id=user_id, sid=sid, jti=jti)
+        raise HTTPException(status_code=401, detail="Usuario no activo.")
+
+    # 4) Validar sesión activa (tu single-session enforcement)
     if not db_is_session_active(user_id, jti):
+        _log("auth_fail", request, reason="session_revoked_or_expired", status=401, user_id=user_id, sid=sid, jti=jti)
         raise HTTPException(status_code=401, detail="Sesión inválida o revocada.")
 
-    db_touch_session_last_seen(user_id, jti)
+    # 5) Touch last seen (no debe romper)
+    try:
+        db_touch_session_last_seen(user_id, jti)
+    except Exception:
+        pass
 
-    # Fuente de verdad del plan: DB
+    # 6) Fuente de verdad del plan: DB
     plan_db = (u.get("plan") or "free").strip().lower()
     if plan_db not in ("free", "pro", "premium"):
         plan_db = "free"
 
-    return {
+    out = {
         "user_id": user_id,
         "plan": plan_db,
         "email": (u.get("email") or "").strip().lower(),
@@ -1339,12 +1432,34 @@ def require_user(token: str = Depends(oauth2_scheme)) -> dict:
         "terms_version": u.get("terms_version"),
     }
 
+    # (opcional) log de auth ok cuando lo necesites
+    if os.getenv("EVANTIS_LOG_AUTH_OK", "0") == "1":
+        _log("auth_ok", request, user_id=user_id, sid=sid, jti=jti, plan=plan_db)
+
+    return out
+
 def require_plan(min_plan: Plan, user: dict = Depends(require_user)) -> dict:
     order = {"free": 0, "pro": 1, "premium": 2}
     if order.get(user["plan"], 0) < order.get(min_plan, 0):
         raise HTTPException(status_code=403, detail=f"Requiere plan {min_plan} o superior.")
     return user
 
+def is_admin_email(email: str) -> bool:
+    admins = os.getenv("ADMIN_EMAILS", "")
+    allowed = [x.strip().lower() for x in admins.split(",") if x.strip()]
+    return email.strip().lower() in allowed
+
+
+def require_admin(user=Depends(require_user)):
+    # require_user debe devolver al menos el email del usuario
+    if isinstance(user, dict):
+        email = str(user.get("email") or "")
+    else:
+        email = str(getattr(user, "email", "") or "")
+
+    if not email or not is_admin_email(email):
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
 
 def can_use_web_search(plan: Plan) -> bool:
     return plan in ("pro", "premium")
@@ -2017,13 +2132,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def http_exception_handler(request, exc):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print("🔥 Unhandled exception:", repr(exc))
+    _log("http_500", request, error=repr(exc))
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error"},
+        content={"detail": "Internal server error", "rid": _rid(request)},
     )
 
 @app.on_event("startup")
@@ -3586,6 +3700,84 @@ def usage_me(user: dict = Depends(require_user)):
         except Exception:
             pass
 
+@app.get("/admin/overview")
+def admin_overview(admin=Depends(require_admin)):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    try:
+        total_users = cur.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+        # Si tu users NO tiene created_at, esto va a fallar.
+        # En ese caso, lo capturamos y devolvemos None.
+        since = (datetime.utcnow() - timedelta(days=7)).isoformat(timespec="seconds")
+        new_7d = None
+        try:
+            new_7d = cur.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE created_at >= ?",
+                (since,),
+            ).fetchone()["n"]
+        except Exception:
+            new_7d = None
+
+        # Si tienes tabla usage_logs(ts,module,...) te agrega uso mensual.
+        usage_month = None
+        try:
+            month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+            rows = cur.execute(
+                """
+                SELECT module, COUNT(*) AS n
+                FROM usage_logs
+                WHERE ts >= ?
+                GROUP BY module
+                """,
+                (month_start,),
+            ).fetchall()
+            usage_month = {r["module"]: r["n"] for r in rows}
+        except Exception:
+            usage_month = None
+
+        return {
+            "ok": True,
+            "users": {"total": total_users, "new_7d": new_7d},
+            "usage_month": usage_month,
+            "server_time_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+    finally:
+        conn.close()
+
+@app.get("/admin/users")
+def admin_users(limit: int = 50, admin=Depends(require_admin)):
+    limit = max(1, min(int(limit or 50), 200))
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    try:
+        # Si no existe created_at, cambia ORDER BY created_at -> ORDER BY rowid
+        rows = cur.execute(
+            """
+            SELECT id, email, plan, created_at
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "email": r["email"],
+                "plan": r["plan"],
+                "created_at": r["created_at"],
+            })
+        return {"items": out}
+    finally:
+        conn.close()
 
 # ----------------------------
 # /teach (general) — PATCH: prompt limpio + TeachResponse correcto
