@@ -1693,15 +1693,24 @@ def require_student_or_admin(x_api_key: str = Header(None, alias="X-API-Key")) -
         pass
     return x_api_key
 
+def is_admin_email(email: str) -> bool:
+    admins = os.getenv("ADMIN_EMAILS", "")
+    allowed = [x.strip().lower() for x in admins.split(",") if x.strip()]
+    return email.strip().lower() in allowed
 
-def require_admin(x_api_key: str = Depends(require_student_or_admin)) -> str:
-    row = db_get_key(x_api_key)
-    if not row:
-        raise HTTPException(status_code=403, detail="No autorizado")
-    _, role, _, is_active = row
-    if int(is_active) != 1 or role != "admin":
-        raise HTTPException(status_code=403, detail="Requiere rol admin")
-    return x_api_key
+
+def require_admin(user=Depends(require_user)):
+    # require_user devuelve dict con email
+    email = ""
+    if isinstance(user, dict):
+        email = str(user.get("email") or "")
+    else:
+        email = str(getattr(user, "email", "") or "")
+
+    if not email or not is_admin_email(email):
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    return user
 
     # ----------------------------
     # Subscription lifecycle
