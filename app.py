@@ -1712,6 +1712,8 @@ def require_admin(user=Depends(require_user)):
 
     return user
 
+
+
     # ----------------------------
     # Subscription lifecycle
     # ----------------------------
