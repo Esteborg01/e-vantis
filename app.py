@@ -402,6 +402,13 @@ allowed = sorted({o for o in allowed if o})
 
 print(">>> CORS allowed =", allowed)
 
+ALLOWED_ORIGINS = [
+    "https://app.e-vantis.com",
+    "https://e-vantis.com",
+    "http://localhost:5173",   # dev
+    "http://localhost:3000",   # opcional dev
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed,              # ✅ ESTA es la lista correcta
