@@ -404,7 +404,6 @@ parsed = _parse_cors_origins(env_origins)
 allowed = parsed or [o.rstrip("/") for o in default_origins]
 allowed = sorted({o for o in allowed if o})
 
-print(">>> CORS allowed =", allowed)
 
 app.add_middleware(
     CORSMiddleware,
@@ -415,7 +414,6 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-print(">>> LOADED app.py FROM:", __file__)
 app.include_router(curriculum_router)
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -943,6 +941,15 @@ def db_init():
         )
         """)
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            user_id TEXT,
+            event TEXT NOT NULL,
+            props_json TEXT
+        )
+        """)
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS rate_limit (
             key TEXT PRIMARY KEY,
             window_start INTEGER NOT NULL,
@@ -973,6 +980,9 @@ def db_init():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_jti ON user_sessions(jti)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_active ON user_sessions(user_id, is_active)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_user_id ON events(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_event ON events(event)")
         conn.commit()
 
         # ----------------------------
@@ -1165,6 +1175,27 @@ def db_log_usage(
                 except Exception:
                     print("db_log_usage failed:", repr(e))
             return
+
+def db_log_event(user_id: Optional[str], event: str, props: Optional[dict] = None) -> None:
+    """
+    Guarda eventos de producto para métricas reales (DAU/WAU/MAU/funnel).
+    100% no-bloqueante: si falla, NO rompe el request.
+    """
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO events(created_at, user_id, event, props_json) VALUES(?, ?, ?, ?)",
+                (
+                    _now_iso(),
+                    user_id,
+                    (event or "").strip(),
+                    json.dumps(props or {}, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        # Nunca romper flujo principal por métricas
+        pass
 
 def db_get_user_by_email(email: str):
     with db_conn() as conn:
@@ -1961,6 +1992,13 @@ async def stripe_webhook(request: Request):
                     status=status,
                 )
                 db_set_plan(user_id, plan)
+                db_log_event(user_id, "billing_checkout_completed", {
+                    "plan": plan,
+                    "customer_id": customer_id,
+                    "subscription_id": subscription_id,
+                    "status": status,
+                    "event_type": event_type,
+                })
                 print(f"[STRIPE_WEBHOOK] checkout.completed user={user_id} plan={plan}")
                 return {"ok": True}
 
@@ -2009,12 +2047,27 @@ async def stripe_webhook(request: Request):
             terminal = status in ("canceled", "incomplete_expired")
             if event_type == "customer.subscription.deleted" or terminal:
                 db_set_plan(user["user_id"], "free")
+                db_log_event(user["user_id"], "billing_plan_downgraded", {
+                    "plan": "free",
+                    "status": status,
+                    "customer_id": customer_id,
+                    "subscription_id": sub_id,
+                    "event_type": event_type,
+                })
                 return {"ok": True}
 
             if status in ("active", "trialing"):
                 plan = plan_from_price_id(price_id)
                 if plan in ("pro", "premium"):
                     db_set_plan(user["user_id"], plan)
+                    db_log_event(user["user_id"], "billing_plan_upgraded", {
+                        "plan": plan,
+                        "status": status,
+                        "customer_id": customer_id,
+                        "subscription_id": sub_id,
+                        "price_id": price_id,
+                        "event_type": event_type,
+                    })
             return {"ok": True}
 
         return {"ok": True}
@@ -3388,6 +3441,7 @@ def verify_email(token: str):
         raise HTTPException(status_code=410, detail="Token expirado. Solicita uno nuevo.")
 
     db_mark_email_verified(row["user_id"])
+    db_log_event(row["user_id"], "email_verified", {"email": row.get("email")})
     return {"ok": True, "status": "verified"}
 
 @app.post("/auth/register", response_model=RegisterResponse)
@@ -3412,6 +3466,7 @@ def register(req: RegisterRequest):
         raise HTTPException(status_code=500, detail="No se pudo procesar la contraseña. Intenta de nuevo.")
 
     user_id = db_create_user(email=email, password_hash=pw_hash, plan="free")
+    db_log_event(user_id, "register_success", {"email": email})
 
     # A3: generar token verify
     if EVANTIS_EMAIL_VERIFY_ENABLED:
@@ -3536,6 +3591,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = N
     db_insert_session(user["user_id"], sid, jti, now, exp, ip=ip, user_agent=ua)
 
     token = create_access_token(user_id=user["user_id"], plan=plan, sid=sid, jti=jti)  # type: ignore[arg-type]
+    db_log_event(user["user_id"], "login_success", {"plan": plan, "email": email})
     return TokenResponse(access_token=token, token_type="bearer", plan=plan)
 
 @app.post("/auth/forgot-password")
@@ -3774,6 +3830,116 @@ def admin_overview(admin=Depends(require_admin)):
     finally:
         conn.close()
 
+@app.get("/admin/metrics", dependencies=[Depends(require_admin)])
+def admin_metrics(days: int = 30):
+    days = max(1, min(int(days or 30), 180))
+
+    now = datetime.utcnow()
+    since_1d = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    since_7d = (now - timedelta(days=7)).isoformat(timespec="seconds")
+    since_30d = (now - timedelta(days=30)).isoformat(timespec="seconds")
+    since_nd = (now - timedelta(days=days)).isoformat(timespec="seconds")
+
+    try:
+        with db_conn() as conn:
+            # Para acceder por nombre: row["n"]
+            try:
+                conn.row_factory = sqlite3.Row
+            except Exception:
+                pass
+
+            cur = conn.cursor()
+
+            # (Hardening) Si la tabla events aún no existe por algún motivo, responde limpio
+            try:
+                cur.execute("SELECT 1 FROM events LIMIT 1")
+            except Exception:
+                return {
+                    "ok": True,
+                    "window_days": days,
+                    "dau": 0,
+                    "wau": 0,
+                    "mau": 0,
+                    "funnel_30d": {"registered": 0, "logged_in": 0, "generated_lesson": 0},
+                    "usage": {},
+                    "server_time_utc": now.isoformat(timespec="seconds") + "Z",
+                    "note": "events table missing (deploy schema first)",
+                }
+
+            def _get_n(query: str, params: tuple) -> int:
+                row = cur.execute(query, params).fetchone()
+                if row is None:
+                    return 0
+                # soporta sqlite3.Row o tuple
+                if isinstance(row, sqlite3.Row):
+                    return int(row["n"] or 0)
+                return int(row[0] or 0)
+
+            # Active users
+            dau = _get_n(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM events WHERE user_id IS NOT NULL AND created_at >= ?",
+                (since_1d,),
+            )
+            wau = _get_n(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM events WHERE user_id IS NOT NULL AND created_at >= ?",
+                (since_7d,),
+            )
+            mau = _get_n(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM events WHERE user_id IS NOT NULL AND created_at >= ?",
+                (since_30d,),
+            )
+
+            # Funnel 30d: register -> login -> lesson_generated
+            reg = _get_n(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM events WHERE event='register_success' AND created_at >= ?",
+                (since_30d,),
+            )
+            login = _get_n(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM events WHERE event='login_success' AND created_at >= ?",
+                (since_30d,),
+            )
+            lesson = _get_n(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM events WHERE event='lesson_generated' AND created_at >= ?",
+                (since_30d,),
+            )
+
+            rows = cur.execute(
+                """
+                SELECT event, COUNT(*) AS n
+                FROM events
+                WHERE created_at >= ?
+                GROUP BY event
+                ORDER BY n DESC
+                """,
+                (since_nd,),
+            ).fetchall()
+
+            usage = {}
+            for r in rows:
+                if isinstance(r, sqlite3.Row):
+                    usage[r["event"]] = int(r["n"] or 0)
+                else:
+                    usage[r[0]] = int(r[1] or 0)
+
+            return {
+                "ok": True,
+                "window_days": days,
+                "dau": dau,
+                "wau": wau,
+                "mau": mau,
+                "funnel_30d": {
+                    "registered": reg,
+                    "logged_in": login,
+                    "generated_lesson": lesson,
+                },
+                "usage": usage,
+                "server_time_utc": now.isoformat(timespec="seconds") + "Z",
+            }
+
+    except Exception as e:
+        # Respuesta controlada (no 500 para el panel admin)
+        return {"ok": False, "error": str(e)}
+
 @app.get("/admin/users")
 def admin_users(limit: int = 50, admin=Depends(require_admin)):
     limit = max(1, min(int(limit or 50), 200))
@@ -3883,6 +4049,16 @@ Duración:
         model=model,
         approx_output_chars=len(content_text),
     )
+    
+    db_log_event(claims["user_id"], "lesson_generated", {
+        "endpoint": "/teach",
+        "level": level,
+        "duration_minutes": getattr(req, "duration_minutes", None),
+        "topic": getattr(req, "topic", None),
+        "mode": str(mode),
+        "model": str(model),
+        "used_web_search": bool(used_web_search),
+    })
 
     return TeachResponse(
         session_id=req.session_id,
@@ -4351,6 +4527,22 @@ NO modifiques el resto del documento; solo añade el bloque final.
             model=model,
             approx_output_chars=len(content_text),
         )
+
+        # Product metrics (curriculum)
+        db_log_event(user["user_id"], f"{module}_generated", {
+            "endpoint": "/teach/curriculum",
+            "subject_id": payload.subject_id,
+            "topic_id": payload.topic_id,
+            "module": module,
+            "study_mode": study_mode,
+            "level": level,
+            "duration_minutes": duration,
+            "used_web_search": bool(used_web_search),
+            "plan": plan,
+            "use_guides": bool(use_guides),
+            "npm_profile": npm_profile,
+            "editorial_v1": bool(editorial_v1),
+        })
 
         resp_out = {
             "subject": subject_name,
