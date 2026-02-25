@@ -45,6 +45,8 @@ from starlette.responses import Response as StarletteResponse
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
+SUBTOPIC_SCOPE_ENABLED = os.getenv("EVANTIS_SUBTOPIC_SCOPE", "0") == "1"
+print(f"[E-VANTIS] SUBTOPIC_SCOPE_ENABLED={SUBTOPIC_SCOPE_ENABLED}")
 
 # ----------------------------
 # Quotas por plan / módulo (FASE 8)
@@ -4114,6 +4116,7 @@ def teach_curriculum(
         plan = (user.get("plan") or "free").strip().lower()
         subject_id = (as_str(payload.subject_id) or "").strip().lower()
         raw_topic_id = (as_str(payload.topic_id) or "").strip()
+        print(f"[teach/curriculum] RAW topic_id={raw_topic_id}")
         editorial_v1 = bool(getattr(payload, "editorial_v1", False))
 
         if "::" in raw_topic_id:
@@ -4123,6 +4126,7 @@ def teach_curriculum(
         else:
             topic_id = raw_topic_id
             subtopic_id = None
+        print(f"[teach/curriculum] PARSED topic_id={topic_id} subtopic_id={subtopic_id}")
 
         # ----------------------------
         # Plan gating
@@ -4219,6 +4223,26 @@ def teach_curriculum(
         subtopics = normalize_subtopics(topic.get("subtopics", []) or [])
         subtopics_text = "\n".join(f"- {st['name']}" for st in subtopics) if subtopics else "- (Sin subtópicos)"
 
+        # =====================================================
+        # SUBTOPIC HARD SCOPE (Feature Flag Controlled)
+        # =====================================================
+        selected_subtopic_name = None
+
+        if SUBTOPIC_SCOPE_ENABLED and subtopic_id:
+            selected_subtopic = next(
+                (st for st in subtopics if st.get("id") == subtopic_id),
+                None
+            )
+
+            if selected_subtopic:
+                selected_subtopic_name = selected_subtopic.get("name")
+                subtopics_text = f"- {selected_subtopic_name}"
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Subtopic not found: {subtopic_id}"
+                )
+
         topic_npm = topic.get("npm_rules", []) or []
         topic_npm_text = "\n".join([f"- {r}" for r in topic_npm]) if topic_npm else "- (Sin NPM por tema)"
 
@@ -4247,7 +4271,9 @@ Profesor universitario de medicina en la materia: {subject_name}.
 Solicitud: lesson
 
 Materia: {subject_name}
-Tema: {topic_name}
+Tema principal: {topic_name}
+Subtema seleccionado: {selected_subtopic_name if selected_subtopic_name else "No específico"}
+
 Nivel: {level}
 Perfil NPM: {npm_profile}
 
@@ -4261,13 +4287,35 @@ Subtópicos:
 {subtopics_text}
 """.strip()
 
-            if subject_rules_text:
-                user_msg += f"\n\nReglas específicas de la materia (OBLIGATORIAS):\n{subject_rules_text}"
+        # 🔒 Hard-scope (solo si el flag está ON y hay subtema válido)
+        if SUBTOPIC_SCOPE_ENABLED and selected_subtopic_name:
+            user_msg += f"""
 
-            if npm_profile == "clinicas":
-                lvl = (level or "auto").strip().lower()
+INSTRUCCIÓN CRÍTICA (SUBTEMA):
+Desarrolla EXCLUSIVAMENTE el subtema:
+- {selected_subtopic_name}
 
-                user_msg += """
+REGLAS:
+- No expandas otros subtemas del macrotema.
+- No incluyas contenidos de otros subtopics.
+- Si necesitas contexto, limita el contexto a 2–3 líneas máximo y vuelve al subtema.
+""".strip()
+
+        # Recordatorio al final para “última instrucción”
+        user_msg += f"""
+
+RECORDATORIO FINAL:
+Tu salida debe cubrir SOLO: {selected_subtopic_name}
+""".strip()
+
+        if subject_rules_text:
+            user_msg += f"\n\nReglas específicas de la materia (OBLIGATORIAS):\n{subject_rules_text}"
+
+        # ✅ SOLO CLÍNICAS llevan reglas clínicas
+        if npm_profile == "clinicas":
+            lvl = (level or "auto").strip().lower()
+
+            user_msg += r"""
 
 # REGLAS E-VANTIS — PROFUNDIDAD POR NIVEL (CLÍNICAS)
 Regla madre: En materias clínicas NO se omiten secciones ni se altera el orden. Ajusta únicamente la profundidad del contenido según el nivel.
@@ -4286,48 +4334,47 @@ Cumplimiento mínimo obligatorio:
   qué evaluar primero, red flags y cuándo referir.
 - Prohibido usar “No aplica” como respuesta aislada.
 - Prohibido incluir dosis, esquemas o protocolos avanzados salvo solicitud explícita.
-"""
+""".strip()
 
-                if lvl == "pregrado":
-                    user_msg += """
+        if lvl == "pregrado":
+            user_msg += """
 
 Nivel PREGRADO:
 - Diagnóstico general y conceptual.
 - Tratamiento por principios y medidas seguras.
 - Algoritmos básicos con red flags y criterios de referencia.
 """
-                elif lvl == "internado":
-                    user_msg += """
+        elif lvl == "internado":
+            user_msg += """
 
 Nivel CLÍNICO (equivalente a internado):
 - Diagnóstico operativo con criterios de gravedad.
 - Tratamiento con conducta inicial + escalamiento + referencia.
 - Algoritmos orientados a decisión clínica.
 """
-                else:
-                    user_msg += """
+        else:
+            user_msg += """
 
 Nivel AUTO:
 - Comportarse como PREGRADO.
 """
 
-            if editorial_v1:
-                user_msg += "\n\n" + PHASE4_MD_CONVENTION_V1
-                user_msg += "\n\nInstrucción: usa badges/callouts SOLO cuando realmente aporten (no saturar)."
+        if editorial_v1:
+            user_msg += "\n\n" + PHASE4_MD_CONVENTION_V1
+            user_msg += "\n\nInstrucción: usa badges/callouts SOLO cuando realmente aporten (no saturar)."
 
-            user_msg += "\n\n" + build_evantis_header_instruction(subject_name, level, duration, style)
+        user_msg += "\n\n" + build_evantis_header_instruction(subject_name, level, duration, style)
 
-            if npm_profile == "basicas":
-                user_msg += "\n\n" + build_basic_template_instruction()
-            elif npm_profile == "puente":
-                user_msg += "\n\n" + build_bridge_template_instruction()
-            else:
-                user_msg += "\n\n" + build_clinical_template_instruction()
+        if npm_profile == "basicas":
+            user_msg += "\n\n" + build_basic_template_instruction()
+        elif npm_profile == "puente":
+            user_msg += "\n\n" + build_bridge_template_instruction()
+        else:
+            user_msg += "\n\n" + build_clinical_template_instruction()
 
-            # PATCH: NO forces un segundo H2 "Preguntas de repaso" en clínicas.
-            # En clínicas YA viene en CLINICAL_SECTIONS y tu validador exige headings exactos.
-            if npm_profile != "clinicas":
-                user_msg += """
+        # ⚠️ Si tu validador clínico exige headings exactos, NO agregues otro bloque extra.
+        if npm_profile != "clinicas":
+            user_msg += """
 
 # BLOQUE OBLIGATORIO AL FINAL (SIEMPRE)
 Al final del documento agrega EXACTAMENTE este encabezado H2:
@@ -4335,6 +4382,7 @@ Al final del documento agrega EXACTAMENTE este encabezado H2:
 
 Debajo incluye 5–8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
 No omitir este bloque.
+
 """.strip()
 
         # ======================================================================
@@ -4488,7 +4536,7 @@ FALTA UN REQUISITO OBLIGATORIO DEL ESTÁNDAR E-VANTIS.
 Agrega AL FINAL del documento EXACTAMENTE:
 ## Preguntas de repaso
 
-Incluye 5–8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
+Incluye 5-8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
 NO modifiques el resto del documento; solo añade el bloque final.
 """.strip() + "\n\n---\n\n" + content_text
 
