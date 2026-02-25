@@ -4230,18 +4230,21 @@ def teach_curriculum(
 
         if SUBTOPIC_SCOPE_ENABLED and subtopic_id:
             selected_subtopic = next(
-                (st for st in subtopics if st.get("id") == subtopic_id),
+                (st for st in subtopics if (st.get("id") or "").strip() == subtopic_id),
                 None
             )
 
             if selected_subtopic:
-                selected_subtopic_name = selected_subtopic.get("name")
+                selected_subtopic_name = (selected_subtopic.get("name") or "").strip() or None
                 subtopics_text = f"- {selected_subtopic_name}"
             else:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Subtopic not found: {subtopic_id}"
+                # FAIL-OPEN: no romper producción
+                print(
+                    f"[teach/curriculum] WARN Subtopic not found. "
+                    f"subtopic_id={subtopic_id} topic_id={topic_id} subject_id={subject_id}"
                 )
+                selected_subtopic_name = None
+                # subtopics_text se queda como lista completa
 
         topic_npm = topic.get("npm_rules", []) or []
         topic_npm_text = "\n".join([f"- {r}" for r in topic_npm]) if topic_npm else "- (Sin NPM por tema)"
@@ -4264,136 +4267,125 @@ Profesor universitario de medicina en la materia: {subject_name}.
         used_web_search = False
 
         # ======================================================================
-        # MODULE: LESSON
+        # MODULE DISPATCH
         # ======================================================================
         if module == "lesson":
             user_msg = f"""
-Solicitud: lesson
+        Solicitud: lesson
 
-Materia: {subject_name}
-Tema principal: {topic_name}
-Subtema seleccionado: {selected_subtopic_name if selected_subtopic_name else "No específico"}
+        Materia: {subject_name}
+        Tema principal: {topic_name}
+        Subtema seleccionado: {selected_subtopic_name if selected_subtopic_name else "No específico"}
 
-Nivel: {level}
-Perfil NPM: {npm_profile}
+        Nivel: {level}
+        Perfil NPM: {npm_profile}
 
-NPM SISTEMA (OBLIGATORIAS: BASE + PERFIL):
-{system_rules_text}
+        NPM SISTEMA (OBLIGATORIAS: BASE + PERFIL):
+        {system_rules_text}
 
-NPM DEL TEMA (OBLIGATORIAS):
-{topic_npm_text}
+        NPM DEL TEMA (OBLIGATORIAS):
+        {topic_npm_text}
 
-Subtópicos:
-{subtopics_text}
-""".strip()
+        Subtópicos:
+        {subtopics_text}
+        """.strip()
 
-        # 🔒 Hard-scope (solo si el flag está ON y hay subtema válido)
-        if SUBTOPIC_SCOPE_ENABLED and selected_subtopic_name:
-            user_msg += f"""
+            # 🔒 Hard-scope (solo si el flag está ON y hay subtema válido)
+            if SUBTOPIC_SCOPE_ENABLED and selected_subtopic_name:
+                user_msg += f"""
 
-INSTRUCCIÓN CRÍTICA (SUBTEMA):
-Desarrolla EXCLUSIVAMENTE el subtema:
-- {selected_subtopic_name}
+        INSTRUCCIÓN CRÍTICA (SUBTEMA):
+        Desarrolla EXCLUSIVAMENTE el subtema:
+        - {selected_subtopic_name}
 
-REGLAS:
-- No expandas otros subtemas del macrotema.
-- No incluyas contenidos de otros subtopics.
-- Si necesitas contexto, limita el contexto a 2–3 líneas máximo y vuelve al subtema.
-""".strip()
+        REGLAS:
+        - No expandas otros subtemas del macrotema.
+        - No incluyas contenidos de otros subtopics.
+        - Si necesitas contexto, limita el contexto a 2-3 líneas máximo y vuelve al subtema.
+        """.strip()
 
-        # Recordatorio al final para “última instrucción”
-        user_msg += f"""
+                # Recordatorio al final (solo si hay subtema)
+                user_msg += f"""
 
-RECORDATORIO FINAL:
-Tu salida debe cubrir SOLO: {selected_subtopic_name}
-""".strip()
+        RECORDATORIO FINAL:
+        Tu salida debe cubrir SOLO: {selected_subtopic_name}
+        """.strip()
 
-        if subject_rules_text:
-            user_msg += f"\n\nReglas específicas de la materia (OBLIGATORIAS):\n{subject_rules_text}"
+            if subject_rules_text:
+                user_msg += f"\n\nReglas específicas de la materia (OBLIGATORIAS):\n{subject_rules_text}"
 
-        # ✅ SOLO CLÍNICAS llevan reglas clínicas
-        if npm_profile == "clinicas":
-            lvl = (level or "auto").strip().lower()
+            # ✅ SOLO CLÍNICAS llevan reglas clínicas
+            if npm_profile == "clinicas":
+                lvl = (level or "auto").strip().lower()
+                user_msg += r"""
 
-            user_msg += r"""
+        # REGLAS E-VANTIS — PROFUNDIDAD POR NIVEL (CLÍNICAS)
+        Regla madre: En materias clínicas NO se omiten secciones ni se altera el orden. Ajusta únicamente la profundidad del contenido según el nivel.
 
-# REGLAS E-VANTIS — PROFUNDIDAD POR NIVEL (CLÍNICAS)
-Regla madre: En materias clínicas NO se omiten secciones ni se altera el orden. Ajusta únicamente la profundidad del contenido según el nivel.
+        Cumplimiento mínimo obligatorio:
+        - Mantén EXACTAMENTE las 11 secciones clínicas (H2) en orden, sin secciones extra.
+        - En "Diagnóstico" incluye SIEMPRE:
+        1) Enfoque diagnóstico
+        2) Diagnósticos diferenciales (3-6) con una línea discriminativa
+        3) Estándar de oro (nombrar)
+        4) Tamizaje (si aplica; si no aplica, redacción equivalente útil)
+        - En "Tratamiento" incluye SIEMPRE:
+        objetivos, medidas generales seguras, primera línea por principios/familias (sin dosis ni esquemas),
+        y criterios de referencia/urgencia.
+        - En algoritmos incluye SIEMPRE:
+        qué evaluar primero, red flags y cuándo referir.
+        - Prohibido usar "No aplica" como respuesta aislada.
+        - Prohibido incluir dosis, esquemas o protocolos avanzados salvo solicitud explícita.
+        """.strip()
 
-Cumplimiento mínimo obligatorio:
-- Mantén EXACTAMENTE las 11 secciones clínicas (H2) en orden, sin secciones extra.
-- En "Diagnóstico" incluye SIEMPRE:
-  1) Enfoque diagnóstico
-  2) Diagnósticos diferenciales (3–6) con una línea discriminativa
-  3) Estándar de oro (nombrar)
-  4) Tamizaje (si aplica; si no aplica, redacción equivalente útil)
-- En "Tratamiento" incluye SIEMPRE:
-  objetivos, medidas generales seguras, primera línea por principios/familias (sin dosis ni esquemas),
-  y criterios de referencia/urgencia.
-- En algoritmos incluye SIEMPRE:
-  qué evaluar primero, red flags y cuándo referir.
-- Prohibido usar “No aplica” como respuesta aislada.
-- Prohibido incluir dosis, esquemas o protocolos avanzados salvo solicitud explícita.
-""".strip()
+                if lvl == "pregrado":
+                    user_msg += """
+        Nivel PREGRADO:
+        - Diagnóstico general y conceptual.
+        - Tratamiento por principios y medidas seguras.
+        - Algoritmos básicos con red flags y criterios de referencia.
+        """.strip()
+                elif lvl == "internado":
+                    user_msg += """
+        Nivel CLÍNICO (equivalente a internado):
+        - Diagnóstico operativo con criterios de gravedad.
+        - Tratamiento con conducta inicial + escalamiento + referencia.
+        - Algoritmos orientados a decisión clínica.
+        """.strip()
+                else:
+                    user_msg += """
+        Nivel AUTO:
+        - Comportarse como PREGRADO.
+        """.strip()
 
-        if lvl == "pregrado":
-            user_msg += """
+            if editorial_v1:
+                user_msg += "\n\n" + PHASE4_MD_CONVENTION_V1
+                user_msg += "\n\nInstrucción: usa badges/callouts SOLO cuando realmente aporten (no saturar)."
 
-Nivel PREGRADO:
-- Diagnóstico general y conceptual.
-- Tratamiento por principios y medidas seguras.
-- Algoritmos básicos con red flags y criterios de referencia.
-"""
-        elif lvl == "internado":
-            user_msg += """
+            user_msg += "\n\n" + build_evantis_header_instruction(subject_name, level, duration, style)
 
-Nivel CLÍNICO (equivalente a internado):
-- Diagnóstico operativo con criterios de gravedad.
-- Tratamiento con conducta inicial + escalamiento + referencia.
-- Algoritmos orientados a decisión clínica.
-"""
-        else:
-            user_msg += """
+            if npm_profile == "basicas":
+                user_msg += "\n\n" + build_basic_template_instruction()
+            elif npm_profile == "puente":
+                user_msg += "\n\n" + build_bridge_template_instruction()
+            else:
+                user_msg += "\n\n" + build_clinical_template_instruction()
 
-Nivel AUTO:
-- Comportarse como PREGRADO.
-"""
+            # Preguntas de repaso solo para NO clínicas (porque clínicas ya las exige el template)
+            if npm_profile != "clinicas":
+                user_msg += """
 
-        if editorial_v1:
-            user_msg += "\n\n" + PHASE4_MD_CONVENTION_V1
-            user_msg += "\n\nInstrucción: usa badges/callouts SOLO cuando realmente aporten (no saturar)."
+        # BLOQUE OBLIGATORIO AL FINAL (SIEMPRE)
+        Al final del documento agrega EXACTAMENTE este encabezado H2:
+        ## Preguntas de repaso
 
-        user_msg += "\n\n" + build_evantis_header_instruction(subject_name, level, duration, style)
+        Debajo incluye 5-8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
+        No omitir este bloque.
+        """.strip()
 
-        if npm_profile == "basicas":
-            user_msg += "\n\n" + build_basic_template_instruction()
-        elif npm_profile == "puente":
-            user_msg += "\n\n" + build_bridge_template_instruction()
-        else:
-            user_msg += "\n\n" + build_clinical_template_instruction()
-
-        # ⚠️ Si tu validador clínico exige headings exactos, NO agregues otro bloque extra.
-        if npm_profile != "clinicas":
-            user_msg += """
-
-# BLOQUE OBLIGATORIO AL FINAL (SIEMPRE)
-Al final del documento agrega EXACTAMENTE este encabezado H2:
-## Preguntas de repaso
-
-Debajo incluye 5–8 preguntas numeradas (1., 2., 3., ...) basadas en el contenido.
-No omitir este bloque.
-
-""".strip()
-
-        # ======================================================================
-        # MODULE: EXAM
-        # ======================================================================
         elif module == "exam":
             user_msg = build_exam_prompt(subject_name, topic_name, level, study_mode, n_questions=15)
 
-        # ======================================================================
-        # MODULE: EXAM_CLINICO
-        # ======================================================================
         elif module == "exam_clinico":
             if npm_profile == "basicas":
                 raise HTTPException(status_code=422, detail="Caso clínico avanzado no disponible en materias básicas.")
@@ -4405,31 +4397,27 @@ No omitir este bloque.
                 raise HTTPException(status_code=422, detail="num_questions debe estar entre 4 y 20.")
 
             user_msg = f"""
+        Genera un CASO CLÍNICO SERIADO estilo examen clínico de certificación sobre:
+        Materia: {subject_name}
+        Tema: {topic_name}
+        Nivel: {level}
 
-Genera un CASO CLÍNICO SERIADO estilo examen clínico de certificación sobre:
-Materia: {subject_name}
-Tema: {topic_name}
-Nivel: {level}
-
-Requisitos:
-- Caso clínico completo.
-- 1 caso con {n} preguntas seriadas tipo examen clínico.
-- Enfoque discriminativo diagnóstico/interpretación/conducta.
-- NO incluyas dosis exactas salvo que el usuario lo pida.
-""".strip()
+        Requisitos:
+        - Caso clínico completo.
+        - 1 caso con {n} preguntas seriadas tipo examen clínico.
+        - Enfoque discriminativo diagnóstico/interpretación/conducta.
+        - NO incluyas dosis exactas salvo que el usuario lo pida.
+        """.strip()
 
             if use_guides:
                 tools = [{"type": "web_search"}]
                 user_msg += "\n\nUsa web_search para verificar vigencia (GPC México), sin copiar texto literal."
 
             system_msg = """
-Eres E-VANTIS.
-Especialista en razonamiento clínico y evaluación por casos.
-""".strip()
+        Eres E-VANTIS.
+        Especialista en razonamiento clínico y evaluación por casos.
+        """.strip()
 
-        # ======================================================================
-        # MODULE: GPC SUMMARY
-        # ======================================================================
         elif module == "gpc_summary":
             if npm_profile == "basicas":
                 raise HTTPException(status_code=422, detail="gpc_summary no disponible en materias básicas.")
