@@ -10,6 +10,7 @@ import hmac
 import secrets
 import stripe
 import base64
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -243,6 +244,61 @@ def log_json(obj: dict):
     # Render logs friendly: 1 JSON por línea
     print(json.dumps(obj, ensure_ascii=False))
 
+def ga4_send_event(
+    *,
+    client_id: Optional[str],
+    user_id: Optional[str],
+    event_name: str,
+    params: Optional[dict] = None,
+) -> bool:
+    """
+    Envío seguro a GA4 MP. Nunca debe tumbar requests.
+    - Si EVANTIS_GA4_DEBUG=1 usa /debug/mp/collect.
+    - Timeout corto para no bloquear webhooks.
+    """
+    try:
+        if not EVANTIS_GA4_ENABLED:
+            return False
+        if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
+            return False
+
+        cid = (client_id or "").strip()
+        uid = (user_id or "").strip()
+
+        # Requisito MP: al menos uno
+        if not cid and not uid:
+            return False
+
+        base = "https://www.google-analytics.com"
+        path = "/debug/mp/collect" if EVANTIS_GA4_DEBUG else "/mp/collect"
+        endpoint = f"{base}{path}?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}"
+
+        payload = {
+            "timestamp_micros": int(time.time() * 1_000_000),
+            "events": [{"name": event_name, "params": (params or {})}],
+        }
+        if cid:
+            payload["client_id"] = cid
+        if uid:
+            payload["user_id"] = uid
+
+        r = requests.post(endpoint, json=payload, timeout=EVANTIS_GA4_TIMEOUT)
+
+        if EVANTIS_GA4_DEBUG:
+            try:
+                print("[GA4_DEBUG]", r.status_code, (r.text or "")[:1200])
+            except Exception:
+                pass
+
+        return 200 <= int(r.status_code) < 300
+
+    except Exception as e:
+        try:
+            print("[GA4_MP] send_failed:", repr(e))
+        except Exception:
+            pass
+        return False
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
@@ -434,6 +490,15 @@ STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
 STRIPE_PRICE_PREMIUM = os.getenv("STRIPE_PRICE_PREMIUM", "")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip().rstrip("/")
+
+# =========================
+# GA4 Measurement Protocol (Backend)
+# =========================
+GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "").strip()
+GA4_API_SECRET = os.getenv("GA4_API_SECRET", "").strip()
+EVANTIS_GA4_ENABLED = os.getenv("EVANTIS_GA4_ENABLED", "0") == "1"
+EVANTIS_GA4_DEBUG = os.getenv("EVANTIS_GA4_DEBUG", "0") == "1"
+EVANTIS_GA4_TIMEOUT = float(os.getenv("EVANTIS_GA4_TIMEOUT", "2.5"))
 
 def stripe_price_for_plan(plan: str) -> str:
     plan = (plan or "").strip().lower()
@@ -729,7 +794,6 @@ def db_set_stripe_subscription(user_id: str, subscription_id: str, status: str |
         except Exception:
             pass
 
-
 def db_apply_plan_from_stripe(user_id: str, plan: str, is_active: bool, status: str | None = None) -> None:
     plan = (plan or "free").strip().lower()
     if plan not in ("free", "pro", "premium"):
@@ -743,6 +807,33 @@ def db_apply_plan_from_stripe(user_id: str, plan: str, is_active: bool, status: 
             conn.commit()
         except Exception:
             pass
+
+def db_set_ga_client_id(user_id: str, ga_client_id: str) -> None:
+    ga_client_id = (ga_client_id or "").strip()
+    if not user_id or not ga_client_id:
+        return
+    if len(ga_client_id) > 64:
+        ga_client_id = ga_client_id[:64]
+
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET ga_client_id=? WHERE user_id=?",
+            (ga_client_id, user_id),
+        )
+        conn.commit()
+
+def db_get_ga_client_id(user_id: str) -> Optional[str]:
+    if not user_id:
+        return None
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT ga_client_id FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        v = (row[0] or "").strip()
+        return v or None
 
 def db_get_user_by_id(user_id: str) -> dict | None:
     with db_conn() as conn:
@@ -1082,6 +1173,14 @@ def db_init():
         # Backfill defensivo
         try:
             conn.execute("UPDATE users SET accepted_terms=0 WHERE accepted_terms IS NULL")
+        except Exception:
+            pass
+
+        # ----------------------------
+        # GA4 client_id storage
+        # ----------------------------
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN ga_client_id TEXT")
         except Exception:
             pass
 
@@ -1947,6 +2046,7 @@ def _user_email_or_400(user: dict) -> str:
 
 class CheckoutRequest(BaseModel):
     plan: Literal["pro", "premium"]
+    ga_client_id: Optional[str] = None
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -2086,6 +2186,15 @@ def billing_checkout(payload: CheckoutRequest, user: dict = Depends(require_user
             status_code=403,
             detail="Debes aceptar Términos y Condiciones para continuar."
         )
+    # --- GA4: persist ga_client_id (no rompe si no viene) ---
+    try:
+        if getattr(payload, "ga_client_id", None):
+            db_set_ga_client_id(user["user_id"], payload.ga_client_id)
+    except Exception:
+        pass
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe no configurado (STRIPE_SECRET_KEY)")
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe no configurado (STRIPE_SECRET_KEY)")
 
